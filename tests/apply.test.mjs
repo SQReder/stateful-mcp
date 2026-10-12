@@ -143,28 +143,37 @@ test('a hook that stages another file is a scope violation and the commit stays'
   assert.deepEqual(await store.candidateApply(id, c), result);
 });
 
-test('crash while committing keeps an existing trailer commit, or unstages and restores when no commit was made', async (t) => {
-  for (const made of [true, false]) {
+test('crash while committing keeps any commit made after the pre-apply HEAD and restores only when HEAD did not move', async (t) => {
+  const cases = [
+    // [name, file content, staged, commit message trailer?, expected phase, stored status, file kept]
+    ['own commit', PASSING, true, true, 'committed', 'committed', true],
+    ['own commit changed by a hook', `${PASSING}// hook\n`, true, true, 'error', 'error', true],
+    ['developer commit without trailer', PASSING, true, false, 'conflict', undefined, true],
+    ['staged, no commit', PASSING, true, null, 'restored', undefined, false],
+    ['written, crash before git add', PASSING, false, null, 'restored', undefined, false],
+  ];
+  for (const [name, content, staged, trailer, phase, stored, kept] of cases) {
     const f = await fixture(t);
     let store = f.open();
     const id = await f.session(store), c = await f.candidate(store, id, PASSING), before = f.head();
     store.close();
-    writeFileSync(f.target, PASSING);
-    f.run('add', '--', 'value.test.ts');
-    if (made) f.run('commit', '-q', '-m', 'test: add value.test.ts', '-m', `Stateful-Worker-Candidate: ${c}`);
+    writeFileSync(f.target, content);
+    if (staged) f.run('add', '--', 'value.test.ts');
+    if (trailer !== null) f.run('commit', '-q', '-m', 'test: add value.test.ts', ...(trailer ? ['-m', `Stateful-Worker-Candidate: ${c}`] : []));
     const after = f.head();
     f.journal(id, { candidateId: c, phase: 'committing', head: before });
     store = f.open();
     const status = store.status(id);
-    assert.equal(status.phase, made ? 'committed' : 'restored');
-    assert.equal(status.details.errors.at(-1).code, 'apply_interrupted');
-    assert.equal(f.head(), after);
-    assert.deepEqual(f.dirty(), []);
-    assert.equal(existsSync(f.target), made);
-    if (made) {
-      assert.match(status.details.candidates[0].applyResult.diagnostics.join('\n'), /recovered_after_crash/);
-      assert.equal((await store.candidateApply(id, c)).status, 'committed');
-      assert.equal(f.head(), after);
+    assert.equal(status.phase, phase, name);
+    assert.equal(status.details.errors.at(-1).code, 'apply_interrupted', name);
+    assert.equal(status.details.candidates[0].applyResult?.status, stored, name);
+    assert.equal(f.head(), after, name);
+    assert.deepEqual(f.dirty(), [], name);
+    assert.equal(existsSync(f.target) ? readFileSync(f.target, 'utf8') : null, kept ? content : null, name);
+    if (stored) {
+      assert.match(status.details.candidates[0].applyResult.diagnostics.join('\n'), stored === 'committed' ? /recovered_after_crash/ : /committed_unverified/, name);
+      assert.equal((await store.candidateApply(id, c)).status, stored, name);
+      assert.equal(f.head(), after, name);
     }
   }
 });

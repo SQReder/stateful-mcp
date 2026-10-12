@@ -81,7 +81,8 @@ export class SessionStore {
       for (const row of this.db.prepare(`SELECT state FROM sessions WHERE json_extract(state, '$.apply.phase') IN ${BUSY_PHASES}`).all()) {
         const state: Session = JSON.parse(String(row.state)), apply = state.apply!, candidate = this.candidate(state, apply.candidateId);
         apply.phase = apply.phase === 'committing' ? this.recoverCommit(candidate, apply.head ?? '') : this.restore(candidate);
-        const outcomes = { committed: 'its commit exists and was kept', restored: 'target is at its base', conflict: 'target changed externally or Git failed, so it was left untouched' };
+        const outcomes = { committed: 'its commit exists and was kept', error: 'its commit exists but differs from the candidate; it was kept unverified',
+          restored: 'target is at its base', conflict: 'the target changed externally, HEAD moved to an unrecognised commit or Git failed, so files were left untouched' };
         this.recordError(state, new SessionError('apply_interrupted', `Previous apply was interrupted; ${outcomes[apply.phase as keyof typeof outcomes]}; validation was not replayed.`));
       }
     } catch (error: unknown) {
@@ -217,17 +218,29 @@ export class SessionStore {
     return new Promise(resolve => execFile(file, args, { cwd: this.root, env: commandEnv(), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_OUTPUT_LIMIT, windowsHide: true },
       (error, stdout, stderr) => resolve({ code: !error ? 0 : error.killed ? `killed (${error.signal ?? 'timeout or output limit'})` : error.code ?? 'failed', stdout, stderr })));
   }
-  /** Sync because the constructor and the exception path need it: keeps an existing trailer commit, otherwise unstages and restores the target. */
-  private recoverCommit(candidate: Candidate, head: string): 'committed' | 'restored' | 'conflict' {
+  /** Unstages only the target; a new file is dropped from the index, since `restore --staged` fails for paths absent from HEAD. */
+  private unstageArgs(candidate: Candidate): string[] {
+    return candidate.base === null ? ['--literal-pathspecs', 'rm', '--cached', '--quiet', '--ignore-unmatch', '--', candidate.path]
+      : ['--literal-pathspecs', 'restore', '--staged', '--', candidate.path];
+  }
+  /** Sync because the constructor and the exception path need it. Once HEAD has moved, files are never restored: they may be committed. */
+  private recoverCommit(candidate: Candidate, head: string): 'committed' | 'restored' | 'conflict' | 'error' {
     const git = (...args: string[]): string => execFileSync('git', args, { cwd: this.root, env: commandEnv(), encoding: 'utf8',
       timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_OUTPUT_LIMIT, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     try {
-      if (git('rev-parse', 'HEAD').trim() !== head && git('rev-parse', 'HEAD^').trim() === head
-        && git('log', '-1', '--format=%B', 'HEAD').includes(`${CANDIDATE_TRAILER}: ${candidate.id}`)) {
-        candidate.applyResult = { status: 'committed', diagnostics: ['recovered_after_crash: the apply was interrupted after Git created its commit; the commit was kept and post-commit scope and hook checks were not replayed.'], changedFiles: [candidate.path] };
-        return 'committed';
+      if (git('rev-parse', 'HEAD').trim() !== head) {
+        const ours = git('rev-parse', 'HEAD^').trim() === head && git('log', '-1', '--format=%B', 'HEAD').includes(`${CANDIDATE_TRAILER}: ${candidate.id}`);
+        if (!ours) return 'conflict';
+        const files = git('diff-tree', '--no-commit-id', '--name-only', '-r', '-z', 'HEAD').split('\0').filter(Boolean);
+        // The candidate passed the typecheck before the commit, so an exact single-file match is verified; anything else is not.
+        if (files.length === 1 && samePath(files[0], candidate.path) && git('show', `HEAD:${files[0]}`) === candidate.content) {
+          candidate.applyResult = { status: 'committed', diagnostics: ['recovered_after_crash: the apply was interrupted after Git created its commit; the commit holds exactly the candidate and was kept.'], changedFiles: [candidate.path] };
+          return 'committed';
+        }
+        candidate.applyResult = { status: 'error', diagnostics: [`committed_unverified: the apply was interrupted after Git created its commit, which differs from the candidate or touches other paths; it was kept and not typechecked: ${files.join(', ') || 'no paths'}`], changedFiles: files };
+        return 'error';
       }
-      git('--literal-pathspecs', 'restore', '--staged', '--', candidate.path);
+      git(...this.unstageArgs(candidate));
     } catch { return 'conflict'; }
     return this.restore(candidate);
   }
@@ -247,7 +260,7 @@ export class SessionStore {
     const left = await this.changedPaths() ?? ['(Git status unavailable)'];
     const leftDiagnostics = left.length ? [`hooks_left_changes: hooks left uncommitted changes that were not touched: ${left.join(', ')}`] : [];
     // Plain blob bytes as UTF-8: with core.autocrlf the blob is normalized, so a CRLF candidate shows as modified rather than slipping through.
-    const blob = await this.run('git', ['show', `HEAD:${candidate.path}`]);
+    const blob = await this.run('git', ['show', `HEAD:${files[0]}`]); // Git's own spelling: tree lookups are case-sensitive even on Windows
     if (blob.code === 0 && blob.stdout === candidate.content) return { status: 'committed', diagnostics: leftDiagnostics, changedFiles: [candidate.path] };
     const diff = capped('hooks_modified: hooks changed the committed target; diff candidate -> committed', this.replacementDiff(candidate.path, candidate.content, blob.stdout));
     if (blob.code !== 0 || left.length) {
@@ -304,6 +317,8 @@ export class SessionStore {
         return outcome('error', 'typescript_not_found: the workspace must resolve its own typescript package.');
       }
       const journal = (phase: ApplyPhase, head?: string): void => { state.apply = { candidateId, phase, head }; this.save(state); };
+      // Set before staging and never cleared: the exception path must not trust the in-memory phase, which journal() changes before saving.
+      let committingHead: string | undefined;
       journal('applying');
       try {
         writeFileSync(full, candidate.content, { flag: base === null ? 'wx' : 'w' });
@@ -323,17 +338,21 @@ export class SessionStore {
           if (head.code !== 0) {
             failure = outcome('error', 'head_unavailable: the repository needs an initial commit to commit the candidate on.', ...commandDiagnostics(head));
           } else {
-            journal('committing', head.stdout.trim());
+            committingHead = head.stdout.trim();
+            journal('committing', committingHead);
             const added = await this.run('git', ['--literal-pathspecs', 'add', '--', candidate.path]);
             const commit = added.code !== 0 ? added
               : await this.run('git', ['commit', '-m', `test: ${base === null ? 'add' : 'update'} ${candidate.path}`, '-m', `${CANDIDATE_TRAILER}: ${candidateId}`]);
-            if (commit.code === 0) {
+            // A killed or timed-out git (e.g. a slow post-commit hook) may still have created the commit: HEAD decides, not the exit code.
+            const moved = commit.code !== 0 && added.code === 0 && (await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() !== committingHead;
+            if (commit.code === 0 || moved) {
               // Every post-commit outcome is final: the commit stays in history and a retry must not commit again.
-              candidate.applyResult = await this.committedResult(candidate, head.stdout.trim(), tsc, tsconfig, full);
+              const judged = await this.committedResult(candidate, committingHead, tsc, tsconfig, full);
+              candidate.applyResult = moved ? { ...judged, diagnostics: ['commit_exit_nonzero: git reported a failure after creating the commit; the commit was kept.', ...commandDiagnostics(commit), ...judged.diagnostics] } : judged;
               journal(candidate.applyResult.status === 'committed' ? 'committed' : 'error');
               return candidate.applyResult;
             }
-            const unstaged = await this.run('git', ['--literal-pathspecs', 'restore', '--staged', '--', candidate.path]);
+            const unstaged = await this.run('git', this.unstageArgs(candidate));
             failure = outcome('error', 'commit_failed: Git or a hook refused the commit; the target was unstaged and the candidate can be applied again.', ...commandDiagnostics(commit),
               ...(unstaged.code === 0 ? [] : [`unstage_failed: ${candidate.path} may still be staged.`, ...commandDiagnostics(unstaged)]));
           }
@@ -349,7 +368,7 @@ export class SessionStore {
         journal(!restored ? 'conflict' : failure.status === 'error' ? 'error' : 'restored');
         return failure;
       } catch (error: unknown) {
-        const phase = state.apply?.phase === 'committing' ? this.recoverCommit(candidate, state.apply.head ?? '') : this.restore(candidate);
+        const phase = committingHead !== undefined ? this.recoverCommit(candidate, committingHead) : this.restore(candidate);
         journal(phase === 'restored' ? 'error' : phase);
         throw error;
       }
