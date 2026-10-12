@@ -46,7 +46,7 @@ async function sessionResult(operation: (store: SessionStore) => Record<string, 
     if (!sessions) {
       const root = process.env.WORKER_WORKSPACE_ROOT;
       if (!root) throw new ConfigurationError('Missing WORKER_WORKSPACE_ROOT.');
-      sessions = new SessionStore(root, readConfig(), process.env.WORKER_TSCONFIG);
+      sessions = new SessionStore(root, readConfig(), process.env.WORKER_TSCONFIG, process.env.WORKER_POSTPROCESS);
     }
     return result(await operation(sessions));
   } catch (error: unknown) {
@@ -102,5 +102,13 @@ server.registerTool('candidate_apply', {
   inputSchema: z.object({ sessionId: text, candidateId: text }).strict(),
   annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, ({ sessionId, candidateId }) => sessionResult(store => store.candidateApply(sessionId, candidateId)));
+
+server.registerTool('postprocess', {
+  description: 'After candidate_apply returned committed and directly on top of that raw commit in a clean tree: run the trusted WORKER_POSTPROCESS tools (prettier --write, eslint --fix, in configured order) on the raw commit\'s paths only, re-run the typecheck and create a separate style commit with Git hooks enabled (no push). '
+    + 'Returns status committed, no_changes, failed (tool or typecheck failure; files returned to the raw commit, which always stays), conflict (moved HEAD, dirty tree or files changed meanwhile; nothing overwritten) or error (e.g. postprocess_scope_violation when a tool touched other paths; nothing reverted). '
+    + 'eslint exit 1 keeps its fixes and adds lint_problems_remain. Repeating a finished postprocess returns the stored result; commit_failed and tool failures can be retried.',
+  inputSchema: z.object({ sessionId: text }).strict(),
+  annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
+}, ({ sessionId }) => sessionResult(store => store.postprocess(sessionId)));
 
 await server.connect(new StdioServerTransport());
