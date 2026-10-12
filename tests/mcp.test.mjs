@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { test } from 'node:test';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
@@ -32,7 +35,7 @@ test('stdio discovery, validated arguments, errors and subsequent success', asyn
   t.after(() => client.close());
   await client.connect(transport);
   const tools = await client.listTools();
-  assert.deepEqual(tools.tools.map(tool => tool.name).sort(), ['worker_diagnostics', 'worker_instruct']);
+  assert.deepEqual(tools.tools.map(tool => tool.name).sort(), ['context_set', 'session_start', 'session_status', 'worker_chat', 'worker_diagnostics', 'worker_instruct']);
   const diagnostics = await client.callTool({ name: 'worker_diagnostics', arguments: {} });
   assert.equal(diagnostics.structuredContent.configured, true);
   assert.equal(requests, 0);
@@ -50,4 +53,44 @@ test('stdio discovery, validated arguments, errors and subsequent success', asyn
   assert.equal(passed.structuredContent.text, 'ready');
   assert.equal(requests, 2);
   assert.equal(stderr, '');
+});
+
+test('MCP crash recovers a pending turn without replay and status is compact by default', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'worker-crash-'));
+  writeFileSync(join(root, 'source.ts'), 'export const value = 1;');
+  let arrived;
+  const requestArrived = new Promise(resolve => { arrived = resolve; });
+  let requests = 0;
+  const backend = createServer((_req, _res) => { requests++; arrived(); });
+  backend.listen(0, '127.0.0.1'); await once(backend, 'listening');
+  const clients = [];
+  t.after(async () => {
+    for (const client of clients) await client.close();
+    backend.closeAllConnections(); backend.close(); rmSync(root, { recursive: true });
+  });
+  async function connect() {
+    const transport = new StdioClientTransport({ command: process.execPath, args: ['dist/server.js'], cwd: process.cwd(), stderr: 'pipe',
+      env: { WORKER_WORKSPACE_ROOT: root, WORKER_BASE_URL: `http://127.0.0.1:${backend.address().port}/v1`, WORKER_MODEL: 'fake', HARNESS_MODEL_API_KEY: 'fake' } });
+    transport.stderr?.resume();
+    const client = new Client({ name: 'crash-test', version: '1.0.0' });
+    await client.connect(transport); clients.push(client); return { client, transport };
+  }
+  const first = await connect();
+  const started = await first.client.callTool({ name: 'session_start', arguments: { objective: 'Tests', allowedPaths: ['value.test.ts'] } });
+  const sessionId = started.structuredContent.sessionId;
+  await first.client.callTool({ name: 'context_set', arguments: { sessionId, files: ['source.ts'], brief: 'Test value', acceptanceCriteria: [] } });
+  const pending = first.client.callTool({ name: 'worker_chat', arguments: { sessionId, message: 'Generate tests' } }).catch(() => undefined);
+  await requestArrived;
+  process.kill(first.transport.pid, 'SIGKILL');
+  await pending; await first.client.close();
+  const second = await connect();
+  const compact = await second.client.callTool({ name: 'session_status', arguments: { sessionId } });
+  assert.equal(compact.structuredContent.details, undefined);
+  assert.equal(compact.structuredContent.turnCount, 1);
+  assert.equal(compact.structuredContent.errorsCount, 1);
+  assert.equal(compact.structuredContent.pendingAction, undefined);
+  const full = await second.client.callTool({ name: 'session_status', arguments: { sessionId, includeDetails: true } });
+  assert.equal(full.structuredContent.details.errors.at(-1).code, 'interrupted');
+  assert.equal(full.structuredContent.details.context[0].content, 'export const value = 1;');
+  assert.equal(requests, 1);
 });

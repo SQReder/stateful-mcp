@@ -8,7 +8,7 @@ export interface WorkerConfig {
 }
 
 export type WorkerResult =
-  | { ok: true; text: string; finishReason: 'stop' }
+  | { ok: true; text: string; finishReason: 'stop'; usage?: { inputTokens: number; outputTokens: number } }
   | { ok: false; error: { code: string; message: string; status?: number } };
 
 export class ConfigurationError extends Error {}
@@ -40,6 +40,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
 }
 
 const responseSchema = z.object({
+  usage: z.object({ prompt_tokens: z.number().int().nonnegative(), completion_tokens: z.number().int().nonnegative() }).nullish(),
   choices: z.array(z.object({
     message: z.object({
       content: z.string().min(1),
@@ -54,7 +55,7 @@ function failure(code: string, message: string, status?: number): WorkerResult {
   return { ok: false, error: { code, message, ...(status === undefined ? {} : { status }) } };
 }
 
-export async function chat(config: WorkerConfig, message: string): Promise<WorkerResult> {
+export async function chat(config: WorkerConfig, message: string, maxOutputTokens?: number): Promise<WorkerResult> {
   const signal = AbortSignal.timeout(config.timeoutMs);
   try {
     const response = await fetch(`${config.baseUrl}/chat/completions`, {
@@ -62,6 +63,7 @@ export async function chat(config: WorkerConfig, message: string): Promise<Worke
       headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}` },
       body: JSON.stringify({
         model: config.model, stream: false,
+        ...(maxOutputTokens === undefined ? {} : { max_tokens: maxOutputTokens }),
         messages: [
           { role: 'system', content: 'You are an instruct coding worker. Reply with text only; do not call tools.' },
           { role: 'user', content: message },
@@ -82,7 +84,9 @@ export async function chat(config: WorkerConfig, message: string): Promise<Worke
     if (choice.finish_reason !== 'stop' || (choice.message.tool_calls?.length ?? 0) > 0 || choice.message.function_call != null) {
       return failure('incomplete_response', 'Backend returned incomplete text or attempted a tool call.');
     }
-    return { ok: true, text: choice.message.content, finishReason: 'stop' };
+    const usage = parsed.data.usage;
+    return { ok: true, text: choice.message.content, finishReason: 'stop',
+      ...(usage ? { usage: { inputTokens: usage.prompt_tokens, outputTokens: usage.completion_tokens } } : {}) };
   } catch (error: unknown) {
     if (signal.aborted) return failure('timeout', 'Backend request timed out while connecting or reading its response.');
     if (error instanceof SyntaxError) return failure('malformed_response', 'Backend returned invalid JSON.');

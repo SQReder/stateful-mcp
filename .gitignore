@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.stateful-worker/
 .env*
 credentials.json
 *.pem
