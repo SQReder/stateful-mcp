@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
     "start": "node --use-system-ca dist/server.js",
-    "smoke:live": "npm run build && node scripts/live-smoke.mjs"
+    "smoke:live": "npm run build && node scripts/live-smoke.mjs",
+    "smoke:e2e": "npm run build && node scripts/live-e2e.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
