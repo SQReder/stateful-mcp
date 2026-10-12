@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Add `postprocess`: run trusted `WORKER_POSTPROCESS` tools (prettier, eslint) only on raw-commit paths directly on top of the raw commit, re-typecheck and commit the changes separately; failures return files to the raw commit, which always stays.
 - Commit a validated candidate as one local raw commit with Git hooks enabled; report hook changes as `hooksModified` with a diff after a repeated typecheck, and keep any created commit in history instead of resetting it.
 - Add `candidate_apply`: write one approved, current-revision candidate into a clean Git workspace and typecheck it with the workspace `tsc` and a trusted `WORKER_TSCONFIG` that must include the target.
 - Restore the target after a failed typecheck only when nobody else changed it; report `conflict` otherwise, and recover interrupted applies on restart without replaying validation.

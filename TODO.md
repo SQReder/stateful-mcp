@@ -41,7 +41,9 @@
 - [x] Commit the validated target alone with hooks enabled and a candidate trailer; verify scope and committed content; re-typecheck when hooks changed the file (user decision, 2026-10-13).
 - [x] Keep any commit made after the pre-apply HEAD on failures and crashes; never reset, amend or push.
 - [x] Complete the independent review of the raw commit and fix confirmed findings (`npm test`: 41 passed).
-- [ ] Implement `postprocess`: trusted Prettier/ESLint fix only on raw-commit paths, re-typecheck, separate commit or `no_changes`.
+- [x] Implement `postprocess`: trusted Prettier/ESLint fix only on raw-commit paths, re-typecheck, separate commit or `no_changes`.
+- [x] Complete the independent review of `postprocess`; capture commit SHAs right after `git commit` and refuse foreign raw commits (`npm test`: 50 passed).
+- [ ] Verify `postprocess` with real Prettier and ESLint on a pilot project (tests use fake CLIs; `--` handling and ignore patterns are unverified).
 - [ ] Untested branch: git exits non-zero after creating the commit (needs a reliable way to kill git after the commit in tests).
 
 ## Contract updates (user decisions, 2026-10-13)

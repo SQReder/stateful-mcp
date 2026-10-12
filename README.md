@@ -1,11 +1,11 @@
 # Stateful Coding Worker
 
-Локальный MCP-сервер для корпоративного Kilo Code. Реализованы I0–I3 и raw
-commit из I4: stdio transport, text-only inference, долговечные сессии с
-выбранными снимками исходников, кандидаты, review loop, проверка одобренного
-кандидата компиляцией и локальный коммит с Git hooks. Рабочие файлы проекта
-меняет только `candidate_apply`, и только целевой тестовый файл. Postprocess
-(форматирование и отдельный коммит) ещё не реализован; push MCP не делает.
+Локальный MCP-сервер для корпоративного Kilo Code. Реализованы I0–I4:
+stdio transport, text-only inference, долговечные сессии с выбранными снимками
+исходников, кандидаты, review loop, проверка одобренного кандидата компиляцией,
+локальный raw commit с Git hooks и postprocess отдельным коммитом. Рабочие
+файлы проекта меняют только `candidate_apply` (целевой тестовый файл) и
+`postprocess` (только пути raw-коммита). Push MCP не делает.
 
 Нужны Node.js 24+ и npm. Подготовка и проверки:
 
@@ -27,7 +27,8 @@ npm test
 | `HARNESS_MODEL_API_KEY` | Существующий ключ, передаваемый как Bearer |
 | `WORKER_TIMEOUT_MS` | Таймаут подключения и чтения ответа; по умолчанию 60000 |
 | `WORKER_WORKSPACE_ROOT` | Обязательный абсолютный корень проекта для session tools |
-| `WORKER_TSCONFIG` | Путь к tsconfig для проверки кандидата относительно корня проекта; нужен только `candidate_apply` |
+| `WORKER_TSCONFIG` | Путь к tsconfig для проверки кандидата относительно корня проекта; нужен `candidate_apply` и `postprocess` |
+| `WORKER_POSTPROCESS` | Инструменты `postprocess` в порядке запуска через запятую: `prettier`, `eslint` |
 
 `worker_diagnostics({})` проверяет конфигурацию без inference.
 `worker_instruct({ message })` делает ровно один запрос без tools и retries,
@@ -111,6 +112,26 @@ revision и добавляет findings в историю. Устаревший 
 кандидата сохраняется, а чужой коммит или внешняя правка дают `conflict` без
 изменения файлов. Проверка не повторяется автоматически. Репозиторию нужен хотя
 бы один коммит.
+
+`postprocess({ sessionId })` запускается после `committed` и только прямо поверх
+raw-коммита в чистом дереве (иначе `conflict`). Инструменты берутся из
+доверенного `WORKER_POSTPROCESS` (`prettier --write`, `eslint --fix`) и из
+`node_modules` проекта, запускаются без shell и только по путям raw-коммита.
+Затем повторный typecheck:
+
+- изменений нет — `no_changes`, коммита нет;
+- typecheck прошёл — отдельный коммит `style: format <path>` с trailer
+  `Stateful-Worker-Postprocess`, hooks работают как обычно; raw-коммит в
+  истории не меняется;
+- typecheck или инструмент упал — `failed`, файлы возвращены к raw-коммиту;
+- инструмент тронул файлы вне raw-коммита — `error`
+  `postprocess_scope_violation`, ничего не откатывается.
+
+eslint с кодом 1 (исправил, но проблемы остались) не считается ошибкой: в
+ответе будет `lint_problems_remain`. Файлы откатываются, только если в них всё
+ещё результат форматирования, иначе `conflict`. Повтор после завершения
+возвращает сохранённый результат. Сбой инструмента и отказ hook можно
+повторить. После аварии действуют те же правила, что и для `candidate_apply`.
 
 SQLite фиксирована в `<workspace>/.stateful-worker/state.sqlite`, содержит полные
 исходники и тексты диалога; каталог исключён из Git. Одна DB обслуживается одним

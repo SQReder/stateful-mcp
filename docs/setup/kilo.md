@@ -22,7 +22,7 @@
 6. Проверь загрузку `.kilocodemodes`, видимость роли `qwen-test-supervisor`
    и разрешения `read`/`mcp` в корпоративном форке. Роль описывает будущий
    полный workflow; кандидаты и review доступны с I2, apply с проверкой
-   компиляцией и raw commit — с I3–I4, postprocess — ещё нет.
+   компиляцией, raw commit и postprocess — с I3–I4.
 
 Базовый JSON для настроек MCP в формате апстрима Kilo:
 
@@ -40,6 +40,7 @@
         "WORKER_MODEL": "gpt-6-luna",
         "WORKER_WORKSPACE_ROOT": "S:/stateful-mcp",
         "WORKER_TSCONFIG": "tsconfig.json",
+        "WORKER_POSTPROCESS": "prettier,eslint",
         "HARNESS_MODEL_API_KEY": "<API_KEY>"
       }
     }
@@ -104,7 +105,7 @@ symlink-пути запрещены, одна DB — один процесс.
 играл скрипт. Прохождение цикла в корпоративном Kilo с Qwen3.6 в роли
 ревьюера ещё не проверено.
 
-## Проверка apply, компиляции и raw commit (I3–I4)
+## Проверка apply, компиляции, raw commit и postprocess (I3–I4)
 
 `WORKER_TSCONFIG` — путь относительно `WORKER_WORKSPACE_ROOT` к tsconfig,
 в который попадают тестовые файлы. Если основной `tsconfig.json` исключает
@@ -126,5 +127,11 @@ symlink-пути запрещены, одна DB — один процесс.
 4. Передай ошибки компиляции в следующий `worker_chat`; новый кандидат снова
    проходит ревью и `candidate_review` перед `candidate_apply`.
 
-MCP не делает push: публикация коммитов — задача разработчика. Форматирование
-отдельным postprocess-коммитом ещё не реализовано.
+5. После `committed` вызови `postprocess` с тем же `sessionId`.
+   `WORKER_POSTPROCESS` перечисляет инструменты проекта в порядке запуска,
+   например `prettier,eslint`; они должны быть установлены в проекте. Успех —
+   `committed` с отдельным коммитом `style: format <path>` поверх raw-коммита
+   либо `no_changes`, если форматировать нечего. Перед `postprocess` не делай
+   своих коммитов: он работает только прямо поверх raw-коммита.
+
+MCP не делает push: публикация коммитов — задача разработчика.
