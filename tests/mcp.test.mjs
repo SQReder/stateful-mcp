@@ -78,7 +78,7 @@ test('MCP crash recovers a pending turn without replay and status is compact by 
   const first = await connect();
   const started = await first.client.callTool({ name: 'session_start', arguments: { objective: 'Tests', allowedPaths: ['value.test.ts'] } });
   const sessionId = started.structuredContent.sessionId;
-  await first.client.callTool({ name: 'context_set', arguments: { sessionId, files: ['source.ts'], brief: 'Test value', acceptanceCriteria: [] } });
+  await first.client.callTool({ name: 'context_set', arguments: { sessionId, files: ['source.ts'], brief: 'Test value', acceptanceCriteria: ['Value is a number'] } });
   const pending = first.client.callTool({ name: 'worker_chat', arguments: { sessionId, message: 'Generate tests' } }).catch(() => undefined);
   await requestArrived;
   process.kill(first.transport.pid, 'SIGKILL');

@@ -58,7 +58,7 @@ async function fixture(t, { base = null, git = true } = {}) {
   }
   async function session(store) {
     const id = store.start({ objective: 'Add tests', allowedPaths: ['value.test.ts'] }).sessionId;
-    store.contextSet(id, { files: ['source.ts'], brief: 'Test the value', acceptanceCriteria: [] });
+    store.contextSet(id, { files: ['source.ts'], brief: 'Test the value', acceptanceCriteria: ['Value is a number'] });
     return id;
   }
   // The commit under test must be HEAD and a direct child of the pre-apply HEAD.
@@ -201,7 +201,7 @@ test('draft, rejected, stale and not-the-approved candidates are refused without
   const c3 = await f.candidate(store, id, PASSING);
   const c4 = await f.candidate(store, id, FAILING, null);
   await assert.rejects(store.candidateApply(id, c4), /approved/i);
-  store.contextSet(id, { files: ['source.ts'], brief: 'Changed brief', acceptanceCriteria: [] });
+  store.contextSet(id, { files: ['source.ts'], brief: 'Changed brief', acceptanceCriteria: ['Value is a number'] });
   await assert.rejects(store.candidateApply(id, c3), /stale/i);
   await assert.rejects(store.candidateApply(id, 'missing'), /not found/i);
   const current = await f.candidate(store, id, PASSING);
@@ -256,7 +256,7 @@ test('a running apply blocks chat, context and review in its session and any sec
   await assert.rejects(store.candidateApply(other, otherC), { code: 'apply_busy' });
   // The journal phase stays validating for both tsc runs, which take far longer than an event-loop turn.
   while (store.status(id).phase !== 'validating') await new Promise(resolve => setImmediate(resolve));
-  assert.throws(() => store.contextSet(id, { files: ['source.ts'], brief: 'Late change', acceptanceCriteria: [] }), /busy/i);
+  assert.throws(() => store.contextSet(id, { files: ['source.ts'], brief: 'Late change', acceptanceCriteria: ['Value is a number'] }), /busy/i);
   assert.throws(() => store.candidateReview(id, c, 'reject', []), /busy/i);
   await assert.rejects(store.workerChat(id, 'Late request'), /busy/i);
   await assert.rejects(store.candidateApply(other, otherC), { code: 'apply_busy' });

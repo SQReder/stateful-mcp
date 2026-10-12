@@ -7,7 +7,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { chat, type WorkerConfig } from './worker.js';
 import { z } from 'zod';
 
-const HARD_BUDGET = 32_000, WARNING_BUDGET = 24_000, OUTPUT_RESERVE = 8192;
+// The corporate window is 96K tokens; 64K input is the user's safe ceiling, leaving room for the output reserve.
+const HARD_BUDGET = 64_000, WARNING_BUDGET = 48_000, OUTPUT_RESERVE = 8192;
+// shortcut: ~3 UTF-8 bytes per token is conservative for code and Cyrillic; replace with the endpoint tokenizer when known.
+const BYTES_PER_TOKEN = 3, MAX_FILE_BYTES = HARD_BUDGET * BYTES_PER_TOKEN;
+const estimateTokens = (bytes: number): number => Math.ceil(bytes / BYTES_PER_TOKEN);
 // shortcut: one fixed timeout for git and tsc; make it configurable when real projects need longer typechecks.
 const COMMAND_TIMEOUT_MS = 300_000, COMMAND_OUTPUT_LIMIT = 16 * 1024 * 1024, DIAGNOSTIC_LIMIT = 8000;
 const STORE_DIR = '.stateful-worker';
@@ -141,7 +145,7 @@ export class SessionStore {
         : { lastSuccessfulExchange: exchange }),
       // Feedback must describe the code sent as currentCandidate, so it comes only from the latest candidate.
       openFeedback: latest?.state === 'rejected' ? latest.findings : [],
-      outputContract: { instruction: 'Return exactly one JSON object with path and content; no Markdown or additional fields. Content must be the complete test file.', path: state.allowedPaths[0].replaceAll('\\', '/') },
+      outputContract: { instruction: 'Return exactly one JSON object with path and content; no Markdown or additional fields. Content must be the complete test file. Implement exactly the listed acceptance criteria: do not add, drop or change any.', path: state.allowedPaths[0].replaceAll('\\', '/') },
       currentMessage: message });
   }
   private targetBase(path: string): Snapshot | null {
@@ -149,7 +153,7 @@ export class SessionStore {
     if (!lstatSync(full, { throwIfNoEntry: false })) return null;
     const stat = statSync(full, { bigint: true });
     if (!stat.isFile()) throw new SessionError('invalid_path', 'Target base must be a regular file.');
-    if (stat.size > BigInt(HARD_BUDGET)) throw new SessionError('budget_exceeded', 'Target base exceeds the snapshot budget.');
+    if (stat.size > BigInt(MAX_FILE_BYTES)) throw new SessionError('budget_exceeded', 'Target base exceeds the snapshot budget.');
     return this.readSnapshot(path, full, stat);
   }
   private replacementDiff(path: string, base: string | null, content: string): string {
@@ -169,7 +173,7 @@ export class SessionStore {
     const path = state.allowedPaths[0].replaceAll('\\', '/');
     if (parsed.data.path !== path) throw new SessionError('invalid_candidate_path', 'Artifact path differs from the allowed target; no candidate created.');
     // Apply and restore compare files through budget-limited reads, so a larger candidate could never be recognised and restored.
-    if (Buffer.byteLength(parsed.data.content, 'utf8') > HARD_BUDGET) throw new SessionError('invalid_candidate', `Artifact exceeds ${HARD_BUDGET} bytes; no candidate created.`);
+    if (Buffer.byteLength(parsed.data.content, 'utf8') > MAX_FILE_BYTES) throw new SessionError('invalid_candidate', `Artifact exceeds ${MAX_FILE_BYTES} bytes; no candidate created.`);
     const id = randomUUID();
     state.candidates.push({ id, path, content: parsed.data.content, base,
       diff: this.replacementDiff(path, base?.content ?? null, parsed.data.content), contextRevision: state.contextRevision,
@@ -363,14 +367,14 @@ export class SessionStore {
       if (!this.sameFile(expected, opened) || !this.sameFile(opened, statSync(full, { bigint: true }))) {
         throw new SessionError('context_changed', 'Context path changed before snapshot reading.');
       }
-      const buffer = Buffer.alloc(HARD_BUDGET + 1);
+      const buffer = Buffer.alloc(MAX_FILE_BYTES + 1);
       let length = 0;
       while (length < buffer.length) {
         const read = readSync(fd, buffer, length, buffer.length - length, null);
         if (read === 0) break;
         length += read;
       }
-      if (length > HARD_BUDGET) throw new SessionError('budget_exceeded', 'Context file grew beyond the input budget while reading.');
+      if (length > MAX_FILE_BYTES) throw new SessionError('budget_exceeded', 'Context file grew beyond the input budget while reading.');
       this.safePath(path, true);
       const after = fstatSync(fd, { bigint: true });
       // shortcut: these checks detect observed races, native handle containment is needed for hostile path remapping.
@@ -378,15 +382,14 @@ export class SessionStore {
         throw new SessionError('context_changed', 'Context path or content changed while reading the snapshot.');
       }
       const content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer.subarray(0, length));
-      return { path: path.replaceAll('\\', '/'), content, contentHash: createHash('sha256').update(content).digest('hex'), estimatedTokens: length };
+      return { path: path.replaceAll('\\', '/'), content, contentHash: createHash('sha256').update(content).digest('hex'), estimatedTokens: estimateTokens(length) };
     } finally { closeSync(fd); }
   }
   private budget(prompt: string): { estimatedInputTokens: number; warnings: string[]; estimateMethod: string } {
-    // shortcut: UTF-8 bytes plus framing are a conservative heuristic, replace when the endpoint tokenizer is known.
-    const estimatedInputTokens = Buffer.byteLength(prompt, 'utf8') + 256;
-    if (estimatedInputTokens > HARD_BUDGET) throw new SessionError('budget_exceeded', 'Estimated input budget exceeds 32000; replace the context explicitly.');
-    return { estimatedInputTokens, warnings: estimatedInputTokens >= WARNING_BUDGET ? ['Estimated input exceeds 24000; tokenizer error is unknown.'] : [],
-      estimateMethod: 'conservative_utf8_bytes_plus_256_not_exact_tokenizer' };
+    const estimatedInputTokens = estimateTokens(Buffer.byteLength(prompt, 'utf8')) + 256;
+    if (estimatedInputTokens > HARD_BUDGET) throw new SessionError('budget_exceeded', `Estimated input exceeds the ${HARD_BUDGET}-token input budget; replace the context explicitly.`);
+    return { estimatedInputTokens, warnings: estimatedInputTokens >= WARNING_BUDGET ? [`Estimated input exceeds ${WARNING_BUDGET} tokens; tokenizer error is unknown.`] : [],
+      estimateMethod: 'conservative_utf8_bytes_div_3_plus_256_not_exact_tokenizer' };
   }
   start(input: { objective: string; allowedPaths: string[]; acceptanceCriteria?: string[] }): { sessionId: string } {
     if (input.allowedPaths.length !== 1 || !/\.test\.tsx?$/.test(input.allowedPaths[0])) {
@@ -404,13 +407,15 @@ export class SessionStore {
     const state = this.ready(id);
     try {
       if (!input.brief.trim() || input.files.length === 0) throw new SessionError('context_not_ready', 'Provide a nonempty brief and source file list.');
+      // The supervising role owns the design: the worker implements an agreed list and never invents its own.
+      if (!input.acceptanceCriteria.some(item => item.trim())) throw new SessionError('context_not_ready', 'Provide the agreed acceptance criteria (one scenario per item) before inference.');
       let bytes = Buffer.byteLength(input.brief + state.objective + input.acceptanceCriteria.join(''), 'utf8');
       const files = input.files.map(path => {
         const full = this.safePath(path, true), stat = statSync(full, { bigint: true });
         if (!stat.isFile()) throw new SessionError('invalid_path', 'Context path must be a regular file.');
-        if (stat.size > BigInt(HARD_BUDGET)) throw new SessionError('budget_exceeded', 'Context file size exceeds the input budget before reading.');
+        if (stat.size > BigInt(MAX_FILE_BYTES)) throw new SessionError('budget_exceeded', 'Context file size exceeds the input budget before reading.');
         bytes += Number(stat.size);
-        if (bytes > HARD_BUDGET) throw new SessionError('budget_exceeded', 'Context file size exceeds the input budget before reading.');
+        if (estimateTokens(bytes) > HARD_BUDGET) throw new SessionError('budget_exceeded', 'Context file size exceeds the input budget before reading.');
         return { path, full, stat };
       });
       const context = files.map(({ path, full, stat }) => this.readSnapshot(path, full, stat));
@@ -425,7 +430,7 @@ export class SessionStore {
       throw safe;
     }
   }
-  async workerChat(id: string, message: string): Promise<{ candidateId?: string; candidateDiagnostics?: Array<{ code: string; message: string }>; responsePreview: string; finishReason: 'stop'; usage: { inputTokens: number | null; outputTokens: number | null }; estimatedInputTokens: number; warnings: string[]; estimateMethod: string }> {
+  async workerChat(id: string, message: string): Promise<{ candidateId?: string; artifact?: { path: string; content: string }; candidateDiagnostics?: Array<{ code: string; message: string }>; responsePreview?: string; finishReason: 'stop'; usage: { inputTokens: number | null; outputTokens: number | null }; estimatedInputTokens: number; warnings: string[]; estimateMethod: string }> {
     const state = this.ready(id);
     try {
       if (!state.contextRevision || !state.brief.trim() || !state.context.length) throw new SessionError('context_not_ready', 'Set context before inference.');
@@ -445,7 +450,10 @@ export class SessionStore {
         state.errors.push({ ...candidateDiagnostics[0], contextRevision: state.contextRevision });
       }
       this.save(state);
-      return { ...(candidateId ? { candidateId } : { candidateDiagnostics }), responsePreview: response.text, finishReason: response.finishReason,
+      // A candidate is returned as readable code; the raw JSON reply stays in turns and is shown only when it failed to parse.
+      const created = candidateId ? this.candidate(state, candidateId) : undefined;
+      return { ...(created ? { candidateId, artifact: { path: created.path, content: created.content } } : { candidateDiagnostics, responsePreview: response.text }),
+        finishReason: response.finishReason,
         usage: response.usage ?? { inputTokens: null, outputTokens: null }, ...budget };
     } catch (error: unknown) {
       state.pending = false;

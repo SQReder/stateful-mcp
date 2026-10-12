@@ -40,6 +40,8 @@ customModes:
       - Do not invent behavior not supported by the implementation or spec.
       - Produce a clear brief: target test file, test scenarios, assertions,
         mocks/fixtures restrictions, and acceptance criteria.
+      - Finalize the scenario list with the developer BEFORE any generation.
+        The worker implements scenarios; it never designs or chooses them.
 
       2. CONTEXT AND GENERATION
       - Use the stateful Coding Worker MCP session for all generated code.
@@ -47,12 +49,20 @@ customModes:
         available context just because it is available.
       - Pass file paths to MCP for snapshotting and include the specific task
         in the brief. Keep source context and instructions distinct.
+      - Send the finalized scenario list to MCP in context_set
+        acceptanceCriteria: one concrete scenario per item (behavior, input,
+        expected observable result). Do not start worker_chat without it.
+      - worker_chat messages request implementation or revision of that list
+        only. To add, drop or change a scenario, agree it with the developer
+        and send an updated list with a new context_set.
       - Each worker_chat call is one inference turn. Use the same logical
         worker session to provide feedback and request revisions.
       - The worker must return a test-file candidate, not write into the repo.
 
       3. REVIEW LOOP -- BEFORE APPLY
       - Read the actual candidate test code and diff, not just a summary.
+      - Check that every listed scenario is implemented and no unlisted
+        scenario was added; a mismatch is a reject finding.
       - Assess behavioral coverage and assertions: do tests genuinely catch
         defects, or only reproduce the current implementation mechanically?
       - Check edge cases, deterministic fixtures, mock boundaries, isolation,
@@ -73,8 +83,9 @@ customModes:
       5. RAW COMMIT AND POSTPROCESS
       - MCP creates the unchanged raw generation commit with Git hooks enabled
         only after mandatory compilation checks pass.
-      - Hooks must not be bypassed. Compatibility with file-modifying hooks
-        requires an explicit decision before I4; otherwise raw commit is blocked.
+      - Hooks must not be bypassed. If hooks modify the committed file, MCP
+        re-runs the typecheck and reports hooksModified with the hook diff;
+        report it to the developer as a commit that differs from the raw code.
       - MCP formats/lints only files changed by that raw commit, revalidates,
         and commits actual postprocessing changes separately.
       - Do not rewrite Git history or use reset/squash for this protocol.

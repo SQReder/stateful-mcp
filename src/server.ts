@@ -63,12 +63,12 @@ server.registerTool('session_start', {
 }, input => sessionResult(store => store.start(input)));
 
 server.registerTool('context_set', {
-  description: 'Explicitly replace selected source snapshots and brief; increments revision, checks estimated budget without truncation.',
-  inputSchema: z.object({ sessionId: text, files: z.array(text).min(1), brief: text, acceptanceCriteria: z.array(text) }).strict(),
+  description: 'Explicitly replace selected source snapshots, brief and the agreed acceptance criteria (one scenario per item; the worker implements exactly this list); increments revision, checks estimated budget without truncation.',
+  inputSchema: z.object({ sessionId: text, files: z.array(text).min(1), brief: text, acceptanceCriteria: z.array(text).min(1) }).strict(),
 }, ({ sessionId, ...input }) => sessionResult(store => store.contextSet(sessionId, input)));
 
 server.registerTool('worker_chat', {
-  description: 'One inference using selected context, latest candidate once and its findings if it was rejected. Requests one JSON path/content artifact; ordinary replies remain stored with candidate diagnostics. Never applies code.',
+  description: 'One inference using selected context, latest candidate once and its findings if it was rejected. Requests one JSON path/content artifact and returns a new candidate as candidateId plus artifact {path, content}, ready for review without candidate_read; invalid replies return responsePreview and candidate diagnostics. Never applies code.',
   inputSchema: z.object({ sessionId: text, message: text }).strict(),
 }, ({ sessionId, message }) => sessionResult(store => store.workerChat(sessionId, message)));
 
@@ -82,7 +82,7 @@ server.registerTool('session_status', {
 }));
 
 server.registerTool('candidate_read', {
-  description: 'Read one immutable full-code candidate and generation-time unified replacement diff; does not read current source files.',
+  description: 'Read one immutable full-code candidate with its generation-time unified replacement diff and review history; for older versions, diffs or after a restart. Not needed right after worker_chat, which already returns the code. Does not read current source files.',
   inputSchema: z.object({ sessionId: text, candidateId: text }).strict(),
   annotations: { readOnlyHint: true, openWorldHint: false },
 }, ({ sessionId, candidateId }) => sessionResult(store => store.candidateRead(sessionId, candidateId)));

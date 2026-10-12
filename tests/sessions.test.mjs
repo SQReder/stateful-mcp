@@ -86,6 +86,12 @@ test('candidate versions and rejection feedback survive restart with immutable g
   store.contextSet(id, context);
   const first = await store.workerChat(id, 'Generate first version');
   assert.ok(first.candidateId);
+  // The reviewer gets readable code at once; the raw JSON reply would only duplicate it.
+  assert.deepEqual(first.artifact, { path: 'value.test.ts', content: 'reply-1' });
+  assert.equal(first.responsePreview, undefined);
+  const firstPrompt = JSON.parse(f.requests[0].messages.at(-1).content);
+  assert.deepEqual(firstPrompt.acceptanceCriteria, context.acceptanceCriteria);
+  assert.match(firstPrompt.outputContract.instruction, /exactly the listed acceptance criteria/i);
   const code = store.candidateRead(id, first.candidateId);
   assert.equal(code.artifacts[0].content, 'reply-1');
   assert.equal(code.artifacts[0].diff, '--- a/value.test.ts\n+++ b/value.test.ts\n@@ -1,1 +1,1 @@\n-old line\n+reply-1\n\\ No newline at end of file\n');
@@ -146,13 +152,14 @@ test('existing I1 session records gain candidate fields without losing revision 
 });
 
 test('plain/malformed/path-mismatched/blank responses preserve raw history without creating candidates', async (t) => {
-  for (const raw of ['plain answer', JSON.stringify({ path: '../other.test.ts', content: 'code' }), JSON.stringify({ path: 'value.test.ts', content: '  \n' }), JSON.stringify({ path: 'value.test.ts', content: 'я'.repeat(16001) })]) {
+  for (const raw of ['plain answer', JSON.stringify({ path: '../other.test.ts', content: 'code' }), JSON.stringify({ path: 'value.test.ts', content: '  \n' }), JSON.stringify({ path: 'value.test.ts', content: 'я'.repeat(96001) })]) {
     const f = await fixture(t, res => res.end(JSON.stringify({ choices: [{ message: { content: raw }, finish_reason: 'stop' }] })));
     const store = f.open(), id = start(store);
     store.contextSet(id, context);
     const result = await store.workerChat(id, 'request');
     assert.equal(result.candidateId, undefined);
     assert.equal(result.candidateDiagnostics.length, 1);
+    assert.equal(result.responsePreview, raw);
     assert.equal(store.status(id).details.candidates.length, 0);
     assert.equal(store.status(id).details.turns.at(-1).text, raw);
     assert.equal(store.status(id).details.errors.length, 1);
@@ -175,15 +182,16 @@ test('sessions are isolated and budget failures make no backend request or parti
   const a = start(store), b = start(store);
   store.contextSet(a, context);
   store.contextSet(b, { ...context, brief: 'Other isolated brief' });
-  const warning = store.contextSet(a, { ...context, brief: 'x'.repeat(25000) });
+  assert.throws(() => store.contextSet(a, { ...context, acceptanceCriteria: [] }), /acceptance criteria/i);
+  const warning = store.contextSet(a, { ...context, brief: 'x'.repeat(145000) });
   assert.equal(warning.warnings.length, 1);
-  assert.throws(() => store.contextSet(a, { ...context, brief: 'x'.repeat(33000) }), /budget/i);
+  assert.throws(() => store.contextSet(a, { ...context, brief: 'x'.repeat(200000) }), /budget/i);
   assert.equal(store.status(a).contextRevision, 2);
-  await assert.rejects(store.workerChat(b, 'x'.repeat(33000)), /budget/i);
+  await assert.rejects(store.workerChat(b, 'x'.repeat(200000)), /budget/i);
   assert.equal(f.requests.length, 0);
   assert.equal(store.status(b).details.brief, 'Other isolated brief');
   assert.equal(store.status(b).details.errors.at(-1).code, 'budget_exceeded');
-  writeFileSync(join(f.root, 'large.ts'), 'x'.repeat(33000));
+  writeFileSync(join(f.root, 'large.ts'), 'x'.repeat(200000));
   assert.throws(() => store.contextSet(b, { ...context, files: ['large.ts'] }), /budget/i);
   assert.equal(store.status(b).contextRevision, 1);
 });
