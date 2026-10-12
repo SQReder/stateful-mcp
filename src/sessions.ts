@@ -3,15 +3,24 @@ import { lstatSync, mkdirSync, realpathSync, statSync, openSync, fstatSync, read
 import { dirname, isAbsolute, join, relative, parse } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { chat, type WorkerConfig } from './worker.js';
+import { z } from 'zod';
 
 const HARD_BUDGET = 32_000, WARNING_BUDGET = 24_000, OUTPUT_RESERVE = 8192;
 interface Snapshot { path: string; content: string; contentHash: string; estimatedTokens: number }
 interface Turn { role: 'supervisor' | 'worker'; text: string; contextRevision: number }
 interface StoredError { code: string; message: string; contextRevision: number }
+export interface ReviewFinding { severity: 'blocker' | 'major' | 'minor'; message: string; location?: string }
+interface Candidate {
+  readonly id: string; readonly path: string; readonly content: string; readonly diff: string;
+  readonly contextRevision: number; readonly base: Snapshot | null;
+  state: 'draft' | 'approved' | 'rejected'; findings: ReviewFinding[];
+  reviews: Array<{ verdict: 'approve' | 'reject'; findings: ReviewFinding[]; contextRevision: number }>;
+}
+const artifactSchema = z.object({ path: z.string(), content: z.string().refine(value => value.trim().length > 0) }).strict();
 interface Session {
   id: string; workspaceRoot: string; objective: string; allowedPaths: string[];
   brief: string; acceptanceCriteria: string[]; contextRevision: number;
-  context: Snapshot[]; turns: Turn[]; errors: StoredError[]; pending: boolean;
+  context: Snapshot[]; turns: Turn[]; errors: StoredError[]; pending: boolean; candidates: Candidate[];
 }
 interface ContextInput { files: string[]; brief: string; acceptanceCriteria: string[] }
 export class SessionError extends Error {
@@ -59,6 +68,7 @@ export class SessionStore {
     const row = this.db.prepare('SELECT state FROM sessions WHERE id = ?').get(id);
     if (!row) throw new SessionError('session_not_found', 'Session not found.');
     const state: Session = JSON.parse(String(row.state));
+    state.candidates ??= [];
     if (state.workspaceRoot !== this.root) throw new SessionError('workspace_mismatch', 'Session belongs to another workspace.');
     return state;
   }
@@ -93,11 +103,67 @@ export class SessionStore {
   private prompt(state: Session, message = ''): string {
     const last = state.turns.findLastIndex(turn => turn.role === 'worker');
     const exchange = last < 0 ? [] : state.turns.slice(last - 1, last + 1);
+    const latest = state.candidates.at(-1);
     return JSON.stringify({ objective: state.objective, brief: state.brief,
       acceptanceCriteria: state.acceptanceCriteria, allowedPaths: state.allowedPaths,
       contextRevision: state.contextRevision, context: state.context,
-      lastSuccessfulExchange: exchange,
+      ...(latest ? { currentCandidate: { path: latest.path, content: latest.content, contextRevision: latest.contextRevision }, previousRequest: exchange[0]?.text }
+        : { lastSuccessfulExchange: exchange }),
+      // Feedback must describe the code sent as currentCandidate, so it comes only from the latest candidate.
+      openFeedback: latest?.state === 'rejected' ? latest.findings : [],
+      outputContract: { instruction: 'Return exactly one JSON object with path and content; no Markdown or additional fields. Content must be the complete test file.', path: state.allowedPaths[0].replaceAll('\\', '/') },
       currentMessage: message });
+  }
+  private targetBase(state: Session): Snapshot | null {
+    const path = state.allowedPaths[0], full = this.safePath(path, false);
+    if (!lstatSync(full, { throwIfNoEntry: false })) return null;
+    const stat = statSync(full, { bigint: true });
+    if (!stat.isFile()) throw new SessionError('invalid_path', 'Target base must be a regular file.');
+    if (stat.size > BigInt(HARD_BUDGET)) throw new SessionError('budget_exceeded', 'Target base exceeds the snapshot budget.');
+    return this.readSnapshot(path, full, stat);
+  }
+  private replacementDiff(path: string, base: string | null, content: string): string {
+    if (base === content) return '';
+    const split = (text: string): string[] => text ? text.split('\n').slice(0, text.endsWith('\n') ? -1 : undefined) : [];
+    const before = split(base ?? ''), after = split(content);
+    const block = (lines: string[], text: string, sign: string): string => lines.map((line, index) =>
+      `${sign}${line}\n${index === lines.length - 1 && !text.endsWith('\n') ? '\\ No newline at end of file\n' : ''}`).join('');
+    return `--- ${base === null ? '/dev/null' : `a/${path}`}\n+++ b/${path}\n@@ -${before.length ? 1 : 0},${before.length} +${after.length ? 1 : 0},${after.length} @@\n`
+      + block(before, base ?? '', '-') + block(after, content, '+');
+  }
+  private addCandidate(state: Session, response: string, base: Snapshot | null): string {
+    let value: unknown;
+    try { value = JSON.parse(response); } catch { throw new SessionError('invalid_candidate', 'Reply is not a single JSON artifact; no candidate created.'); }
+    const parsed = artifactSchema.safeParse(value);
+    if (!parsed.success) throw new SessionError('invalid_candidate', 'Artifact must contain only path and nonblank complete content; no candidate created.');
+    const path = state.allowedPaths[0].replaceAll('\\', '/');
+    if (parsed.data.path !== path) throw new SessionError('invalid_candidate_path', 'Artifact path differs from the allowed target; no candidate created.');
+    const id = randomUUID();
+    state.candidates.push({ id, path, content: parsed.data.content, base,
+      diff: this.replacementDiff(path, base?.content ?? null, parsed.data.content), contextRevision: state.contextRevision,
+      state: 'draft', findings: [], reviews: [] });
+    return id;
+  }
+  private candidate(state: Session, id: string): Candidate {
+    const candidate = state.candidates.find(candidate => candidate.id === id);
+    if (!candidate) throw new SessionError('candidate_not_found', 'Candidate not found in this session.');
+    return candidate;
+  }
+  candidateRead(id: string, candidateId: string): { artifacts: Array<{ path: string; content: string; diff: string }>; contextRevision: number; currentContextRevision: number; state: string; findings: ReviewFinding[]; reviews: Candidate['reviews'] } {
+    const state = this.load(id), candidate = this.candidate(state, candidateId);
+    return { artifacts: [{ path: candidate.path, content: candidate.content, diff: candidate.diff }],
+      contextRevision: candidate.contextRevision, currentContextRevision: state.contextRevision,
+      state: candidate.contextRevision === state.contextRevision ? candidate.state : 'stale', findings: candidate.findings, reviews: candidate.reviews };
+  }
+  candidateReview(id: string, candidateId: string, verdict: 'approve' | 'reject', findings: ReviewFinding[]): { state: 'approved' | 'rejected' } {
+    const state = this.ready(id), candidate = this.candidate(state, candidateId);
+    if (candidate.contextRevision !== state.contextRevision) throw new SessionError('stale_candidate', 'Candidate is stale; generate a new version on the current revision.');
+    if (candidate.state === 'rejected' && verdict === 'approve') throw new SessionError('candidate_rejected', 'Generate and review a new candidate after rejection.');
+    candidate.state = verdict === 'approve' ? 'approved' : 'rejected';
+    candidate.findings = findings;
+    candidate.reviews.push({ verdict, findings, contextRevision: state.contextRevision });
+    this.save(state);
+    return { state: candidate.state };
   }
   private sameFile(first: BigIntStats, second: BigIntStats): boolean {
     return first.dev === second.dev && first.ino === second.ino && first.size === second.size
@@ -143,7 +209,7 @@ export class SessionStore {
     this.safePath(input.allowedPaths[0], false);
     const state: Session = { id: randomUUID(), workspaceRoot: this.root, ...input,
       brief: '', acceptanceCriteria: input.acceptanceCriteria ?? [], contextRevision: 0,
-      context: [], turns: [], errors: [], pending: false };
+      context: [], turns: [], errors: [], pending: false, candidates: [] };
     this.budget(this.prompt(state));
     this.save(state);
     return { sessionId: state.id };
@@ -173,11 +239,12 @@ export class SessionStore {
       throw safe;
     }
   }
-  async workerChat(id: string, message: string): Promise<{ responsePreview: string; finishReason: 'stop'; usage: { inputTokens: number | null; outputTokens: number | null }; estimatedInputTokens: number; warnings: string[]; estimateMethod: string }> {
+  async workerChat(id: string, message: string): Promise<{ candidateId?: string; candidateDiagnostics?: Array<{ code: string; message: string }>; responsePreview: string; finishReason: 'stop'; usage: { inputTokens: number | null; outputTokens: number | null }; estimatedInputTokens: number; warnings: string[]; estimateMethod: string }> {
     const state = this.ready(id);
     try {
       if (!state.contextRevision || !state.brief.trim() || !state.context.length) throw new SessionError('context_not_ready', 'Set context before inference.');
       const prompt = this.prompt(state, message), budget = this.budget(prompt);
+      const base = this.targetBase(state);
       state.pending = true;
       state.turns.push({ role: 'supervisor', text: message, contextRevision: state.contextRevision });
       this.save(state);
@@ -185,8 +252,14 @@ export class SessionStore {
       if (!response.ok) throw new SessionError(response.error.code, response.error.message);
       state.pending = false;
       state.turns.push({ role: 'worker', text: response.text, contextRevision: state.contextRevision });
+      let candidateId: string | undefined, candidateDiagnostics: Array<{ code: string; message: string }> | undefined;
+      try { candidateId = this.addCandidate(state, response.text, base); } catch (error: unknown) {
+        if (!(error instanceof SessionError)) throw error;
+        candidateDiagnostics = [{ code: error.code, message: error.message }];
+        state.errors.push({ ...candidateDiagnostics[0], contextRevision: state.contextRevision });
+      }
       this.save(state);
-      return { responsePreview: response.text, finishReason: response.finishReason,
+      return { ...(candidateId ? { candidateId } : { candidateDiagnostics }), responsePreview: response.text, finishReason: response.finishReason,
         usage: response.usage ?? { inputTokens: null, outputTokens: null }, ...budget };
     } catch (error: unknown) {
       state.pending = false;
@@ -195,9 +268,11 @@ export class SessionStore {
       throw safe;
     }
   }
-  status(id: string): { phase: string; contextRevision: number; pendingAction?: string; details: Session } {
+  status(id: string): { phase: string; contextRevision: number; latestCandidateId?: string; pendingAction?: string; details: Session } {
     const state = this.load(id);
-    return { phase: state.pending ? 'chatting' : state.contextRevision ? 'ready' : 'draft', contextRevision: state.contextRevision,
+    const latest = state.candidates.at(-1);
+    return { phase: state.pending ? 'chatting' : latest?.contextRevision === state.contextRevision ? ({ approved: 'approved', rejected: 'needs_revision', draft: 'review' } as const)[latest.state] : 'draft', contextRevision: state.contextRevision,
+      ...(latest ? { latestCandidateId: latest.id } : {}),
       ...(state.pending ? { pendingAction: 'wait_for_inference' } : {}), details: state };
   }
 }

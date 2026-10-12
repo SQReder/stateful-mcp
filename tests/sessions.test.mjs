@@ -46,12 +46,14 @@ test('missing backend token usage stays unknown, distinct from the input estimat
   assert.ok(result.estimateMethod.includes('not_exact'));
 });
 
-test('three turns retain history across restart, replay the last successful exchange, and replace snapshots explicitly', async (t) => {
+test('three turns retain history across restart, select the latest candidate, and replace snapshots explicitly', async (t) => {
   const f = await fixture(t);
   let store = f.open();
   const id = start(store);
   assert.equal(store.contextSet(id, context).contextRevision, 1);
   const first = await store.workerChat(id, 'first-request');
+  assert.equal(store.candidateRead(id, first.candidateId).artifacts[0].diff,
+    '--- /dev/null\n+++ b/value.test.ts\n@@ -0,0 +1,1 @@\n+reply-1\n\\ No newline at end of file\n');
   assert.deepEqual(first.usage, { inputTokens: 123, outputTokens: 7 });
   writeFileSync(join(f.root, 'source.ts'), 'export const value = 2;');
   await store.workerChat(id, 'second-request');
@@ -76,12 +78,94 @@ test('three turns retain history across restart, replay the last successful exch
   assert.equal(readFileSync(join(f.root, 'source.ts'), 'utf8'), 'export const value = 2;');
 });
 
-test('truncated or tool-call output is rejected', async (t) => {
+test('candidate versions and rejection feedback survive restart with immutable generation-time diffs', async (t) => {
+  const f = await fixture(t);
+  let store = f.open();
+  const id = start(store);
+  writeFileSync(join(f.root, 'value.test.ts'), 'old line\n');
+  store.contextSet(id, context);
+  const first = await store.workerChat(id, 'Generate first version');
+  assert.ok(first.candidateId);
+  const code = store.candidateRead(id, first.candidateId);
+  assert.equal(code.artifacts[0].content, 'reply-1');
+  assert.equal(code.artifacts[0].diff, '--- a/value.test.ts\n+++ b/value.test.ts\n@@ -1,1 +1,1 @@\n-old line\n+reply-1\n\\ No newline at end of file\n');
+  const findings = [{ severity: 'major', message: 'Assert the observable value' }];
+  store.candidateReview(id, first.candidateId, 'reject', findings);
+  const second = await store.workerChat(id, 'Revise the tests');
+  assert.notEqual(first.candidateId, second.candidateId);
+  const prompt = JSON.parse(f.requests[1].messages.at(-1).content);
+  assert.deepEqual(prompt.openFeedback, findings);
+  assert.equal(f.requests[1].messages.at(-1).content.split('reply-1').length - 1, 1);
+  assert.equal(prompt.lastSuccessfulExchange, undefined);
+  assert.deepEqual(store.candidateReview(id, second.candidateId, 'approve', []), { state: 'approved' });
+  assert.equal(store.status(id).phase, 'approved');
+  assert.equal(readFileSync(join(f.root, 'value.test.ts'), 'utf8'), 'old line\n');
+  writeFileSync(join(f.root, 'value.test.ts'), 'external edit');
+  assert.deepEqual(store.candidateRead(id, first.candidateId).artifacts, code.artifacts);
+  store.close(); store = f.open();
+  assert.equal(store.status(id).details.candidates.length, 2);
+  assert.equal(store.status(id).details.candidates[0].state, 'rejected');
+  assert.deepEqual(store.status(id).details.candidates[0].findings, findings);
+  store.candidateReview(id, first.candidateId, 'reject', [{ severity: 'minor', message: 'Additional review note' }]);
+  store.close(); store = f.open();
+  assert.deepEqual(store.candidateRead(id, first.candidateId).reviews[0].findings, findings);
+  assert.equal(store.candidateRead(id, first.candidateId).reviews.length, 2);
+  assert.deepEqual(store.candidateRead(id, first.candidateId).artifacts, code.artifacts);
+  const third = await store.workerChat(id, 'Old-version review must not reach the approved latest code');
+  const afterOldReview = JSON.parse(f.requests[2].messages.at(-1).content);
+  assert.deepEqual(afterOldReview.openFeedback, []);
+  assert.equal(afterOldReview.currentCandidate.content, 'reply-2');
+  const latestFindings = [{ severity: 'major', message: 'Cover the negative input' }];
+  store.candidateReview(id, third.candidateId, 'reject', latestFindings);
+  store.candidateReview(id, first.candidateId, 'reject', [{ severity: 'minor', message: 'Late note on the first version' }]);
+  assert.equal(store.status(id).phase, 'needs_revision');
+  await store.workerChat(id, 'Revise the latest version');
+  const afterLatestReject = JSON.parse(f.requests[3].messages.at(-1).content);
+  assert.deepEqual(afterLatestReject.openFeedback, latestFindings);
+  assert.equal(afterLatestReject.currentCandidate.content, 'reply-3');
+  store.contextSet(id, context);
+  assert.throws(() => store.candidateReview(id, second.candidateId, 'approve', []), /stale/i);
+  assert.equal(store.candidateRead(id, second.candidateId).state, 'stale');
+  assert.notEqual(store.status(id).phase, 'approved');
+});
+
+test('existing I1 session records gain candidate fields without losing revision or history', async (t) => {
+  const f = await fixture(t);
+  let store = f.open();
+  const id = start(store);
+  store.contextSet(id, context);
+  const legacy = store.status(id).details;
+  delete legacy.candidates;
+  store.close();
+  const db = new DatabaseSync(join(f.root, '.stateful-worker', 'state.sqlite'));
+  db.prepare('UPDATE sessions SET state = ? WHERE id = ?').run(JSON.stringify(legacy), id);
+  db.close(); store = f.open();
+  assert.equal(store.status(id).contextRevision, 1);
+  assert.equal(store.status(id).details.candidates.length, 0);
+  assert.ok((await store.workerChat(id, 'Generate candidate')).candidateId);
+});
+
+test('plain/malformed/path-mismatched/blank responses preserve raw history without creating candidates', async (t) => {
+  for (const raw of ['plain answer', JSON.stringify({ path: '../other.test.ts', content: 'code' }), JSON.stringify({ path: 'value.test.ts', content: '  \n' })]) {
+    const f = await fixture(t, res => res.end(JSON.stringify({ choices: [{ message: { content: raw }, finish_reason: 'stop' }] })));
+    const store = f.open(), id = start(store);
+    store.contextSet(id, context);
+    const result = await store.workerChat(id, 'request');
+    assert.equal(result.candidateId, undefined);
+    assert.equal(result.candidateDiagnostics.length, 1);
+    assert.equal(store.status(id).details.candidates.length, 0);
+    assert.equal(store.status(id).details.turns.at(-1).text, raw);
+    assert.equal(store.status(id).details.errors.length, 1);
+  }
+});
+
+test('truncated or tool-call output cannot become a candidate', async (t) => {
   for (const extra of [{ finish_reason: 'length' }, { finish_reason: 'stop', tool_calls: [{}] }]) {
     const f = await fixture(t, res => res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ path: 'value.test.ts', content: 'code' }), ...(extra.tool_calls ? { tool_calls: extra.tool_calls } : {}) }, finish_reason: extra.finish_reason }] })));
     const store = f.open(), id = start(store);
     store.contextSet(id, context);
     await assert.rejects(store.workerChat(id, 'request'), /incomplete|tool call/i);
+    assert.equal(store.status(id).details.candidates.length, 0);
   }
 });
 

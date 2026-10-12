@@ -35,7 +35,7 @@ test('stdio discovery, validated arguments, errors and subsequent success', asyn
   t.after(() => client.close());
   await client.connect(transport);
   const tools = await client.listTools();
-  assert.deepEqual(tools.tools.map(tool => tool.name).sort(), ['context_set', 'session_start', 'session_status', 'worker_chat', 'worker_diagnostics', 'worker_instruct']);
+  assert.deepEqual(tools.tools.map(tool => tool.name).sort(), ['candidate_read', 'candidate_review', 'context_set', 'session_start', 'session_status', 'worker_chat', 'worker_diagnostics', 'worker_instruct']);
   const diagnostics = await client.callTool({ name: 'worker_diagnostics', arguments: {} });
   assert.equal(diagnostics.structuredContent.configured, true);
   assert.equal(requests, 0);

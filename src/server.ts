@@ -20,7 +20,7 @@ server.registerTool('worker_diagnostics', {
 }, () => {
   try {
     const config = readConfig();
-    return result({ configured: true, model: config.model, timeoutMs: config.timeoutMs, stage: 'I1' });
+    return result({ configured: true, model: config.model, timeoutMs: config.timeoutMs, stage: 'I2' });
   } catch (error: unknown) {
     if (!(error instanceof ConfigurationError)) throw error;
     return result({ configured: false, error: { code: 'configuration_error', message: error.message } }, true);
@@ -68,7 +68,7 @@ server.registerTool('context_set', {
 }, ({ sessionId, ...input }) => sessionResult(store => store.contextSet(sessionId, input)));
 
 server.registerTool('worker_chat', {
-  description: 'One inference using selected context and the last successful exchange. The reply is stored as text. Never applies code.',
+  description: 'One inference using selected context, latest candidate once and its findings if it was rejected. Requests one JSON path/content artifact; ordinary replies remain stored with candidate diagnostics. Never applies code.',
   inputSchema: z.object({ sessionId: text, message: text }).strict(),
 }, ({ sessionId, message }) => sessionResult(store => store.workerChat(sessionId, message)));
 
@@ -78,7 +78,19 @@ server.registerTool('session_status', {
   annotations: { readOnlyHint: true, openWorldHint: false },
 }, ({ sessionId, includeDetails }) => sessionResult(store => {
   const status = store.status(sessionId), { details, ...summary } = status;
-  return { ...summary, turnCount: details.turns.length, errorsCount: details.errors.length, ...(includeDetails ? { details } : {}) };
+  return { ...summary, turnCount: details.turns.length, errorsCount: details.errors.length, candidateCount: details.candidates.length, ...(includeDetails ? { details } : {}) };
 }));
+
+server.registerTool('candidate_read', {
+  description: 'Read one immutable full-code candidate and generation-time unified replacement diff; does not read current source files.',
+  inputSchema: z.object({ sessionId: text, candidateId: text }).strict(),
+  annotations: { readOnlyHint: true, openWorldHint: false },
+}, ({ sessionId, candidateId }) => sessionResult(store => store.candidateRead(sessionId, candidateId)));
+
+server.registerTool('candidate_review', {
+  description: 'Explicitly approve or reject one candidate on the current context revision; append findings to review history. Findings of a rejected latest candidate are sent with it to the next worker_chat.',
+  inputSchema: z.object({ sessionId: text, candidateId: text, verdict: z.enum(['approve', 'reject']),
+    findings: z.array(z.object({ severity: z.enum(['blocker', 'major', 'minor']), message: text, location: text.optional() }).strict()) }).strict(),
+}, ({ sessionId, candidateId, verdict, findings }) => sessionResult(store => store.candidateReview(sessionId, candidateId, verdict, findings)));
 
 await server.connect(new StdioServerTransport());
