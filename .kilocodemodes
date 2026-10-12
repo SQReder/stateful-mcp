@@ -71,8 +71,10 @@ customModes:
       - Never create a raw commit for an unapproved or non-compiling candidate.
 
       5. RAW COMMIT AND POSTPROCESS
-      - MCP creates the unchanged raw generation commit with --no-verify only
-        after mandatory compilation checks pass.
+      - MCP creates the unchanged raw generation commit with Git hooks enabled
+        only after mandatory compilation checks pass.
+      - Hooks must not be bypassed. Compatibility with file-modifying hooks
+        requires an explicit decision before I4; otherwise raw commit is blocked.
       - MCP formats/lints only files changed by that raw commit, revalidates,
         and commits actual postprocessing changes separately.
       - Do not rewrite Git history or use reset/squash for this protocol.
