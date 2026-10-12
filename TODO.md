@@ -1,16 +1,38 @@
 # TODO
 
-## I0 — connectivity gate (open)
+## I0 — connectivity mechanics (accepted by user, 2026-10-13)
 
 - [x] Build the TypeScript stdio MCP skeleton and trusted environment configuration.
 - [x] Verify fake-backend error handling and MCP discovery/calls (`npm test`: 17 passed).
 - [x] Verify TypeScript (`npm run typecheck`).
 - [x] Verify live inference through MCP stdio with TLS enabled (`gpt-6-luna`, `npm run smoke:live`).
-- [ ] Verify real discovery/calls and key delivery in corporate Kilo; configuration and custom-mode formats follow upstream (developer with corporate Kilo).
-- [ ] Verify the target Qwen3-Next model through the authorized endpoint (developer with target model access).
+- [x] Verify real discovery/calls and key delivery in corporate Kilo (user-reported results, 2026-10-13; `qwen2-5-coder-32b-instruct-awq`; diagnostics configured and instruct returned `READY`).
+
+## I1 — durable local sessions
+
+- [x] Persist brief, snapshots, hashes, revisions, full turns and sanitized errors in built-in SQLite.
+- [x] Verify context replacement, session isolation, budget rejection, path boundaries, exclusive storage and crash recovery (`node --test tests/sessions.test.mjs tests/mcp.test.mjs`: 10 affected tests passed after review fixes).
+- [x] Verify three live MCP turns with `gpt-6-luna`, revision 2, restart and unchanged source files.
+- [x] Complete independent review of I1; fix external storage override and snapshot path-race findings with regression tests.
+
+## I2 — candidates and review loop (local mechanics)
+
+- [x] Store immutable candidates (content, generation-time base, full-replacement diff, revision) and append-only review history.
+- [x] Reject invalid, wrong-path or blank artifacts without creating a candidate; keep the raw reply and return diagnostics.
+- [x] Bind approval to a candidate on the current revision; refuse stale and previously rejected candidates.
+- [x] Feed the latest candidate once and, when it was rejected, its findings into the next `worker_chat`.
+- [x] Verify locally (`npm test`: 30 passed after review fixes; live MCP reject → feedback → approve loop on `gpt-6-luna` with restart, source and target unchanged; ad-hoc script, `npm run smoke:live` covers only I0).
+- [x] Complete the independent I2 review; stop pairing the latest code with findings for an older version and report `needs_revision` after a reject.
+- [ ] Known minor gaps from the review, deferred: `session_status` details show raw `approved` for stale candidates (`candidate_read` reports `stale`); when the last reply produced no candidate, the prompt omits that reply while a candidate exists.
+- [ ] Run the review loop from corporate Kilo with Qwen3.6 reviewing real code and diff, without copying between chats (developer with corporate Kilo).
+
+## Deployment/pilot checks
+
+- [ ] Verify target Qwen3-Next access, tokenizer/window and quality in the corporate environment; does not block local I1 by user decision.
+- [ ] Verify role loading and actual permissions in corporate Kilo (developer with corporate Kilo).
 
 ## Later gates
 
-- [ ] Begin I1 only after I0 CONNECTED is confirmed.
+- [x] Begin I1 locally with `gpt-6-luna` after the user's scope decision.
 - [ ] Before I4, decide how to preserve raw generated code when repository hooks modify files; never bypass hooks.
 - [ ] Follow I1–I6 in `IMPLEMENTATION_PLAN.md`; do not add stateful features to I0.

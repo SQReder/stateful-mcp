@@ -1,6 +1,6 @@
 # Stateful Qwen Coding Worker — baseline v0.2
 
-**Статус:** baseline полного workflow; реализован только каркас I0. Gate I0 остаётся открытым, состояние проверок — в IMPLEMENTATION_PLAN.md и TODO.md.
+**Статус:** механика I0 принята пользователем; I1 и механика I2 реализованы и проверены локально. Доступ и качество целевого Qwen отложены до deployment/пилота; состояние проверок — в IMPLEMENTATION_PLAN.md и TODO.md.
 **Дата:** 2026-10-12.  
 **Назначение:** универсальный stateful Coding Worker (MCP) и пилотная специализированная роль Qwen Test Supervisor в корпоративном Kilo Code.  
 **Первый пилот:** написание тестов Vitest для существующего TypeScript-модуля. Пилот **не определяет архитектуру и публичный API**.
