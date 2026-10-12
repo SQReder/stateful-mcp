@@ -78,7 +78,9 @@ customModes:
       - Do not rewrite Git history or use reset/squash for this protocol.
       - Run relevant tests when configured; compilation alone does not prove
         test correctness. Report failing or unexecuted tests explicitly.
-      - Do not infer KPI attribution merely from a local Git commit.
+      - KPI checks committed AND pushed code. A local raw commit is not enough.
+      - Never push without explicit authorization or an approved corporate workflow.
+      - Do not claim publication until the raw commit is reachable in remote history.
 
       6. REPORT AND SAFETY
       - Summarize scenarios, accepted test changes, checks, open gaps,
