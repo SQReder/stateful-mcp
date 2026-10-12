@@ -311,18 +311,22 @@ export class SessionStore {
     const included = listed.code === 0 && listed.stdout.split(/\r?\n/).some(line => line.trim() && samePath(basename(line.trim()), basename(target)) && samePath(realpathSync(line.trim()), target));
     return { listed, checked: included ? await this.run(process.execPath, [tsc, ...TYPECHECK_FLAGS, '-p', tsconfig]) : undefined };
   }
-  /** Judges the commit just made on `head` from the expected files; nothing here reverts it, since history is never rewritten. */
-  private async committedResult(head: string, expected: Array<{ path: string; content: string }>, tsc: string, tsconfig: string, full: string): Promise<Result<'committed' | 'error'>> {
-    const parent = await this.run('git', ['rev-parse', '--verify', 'HEAD^']), paths = expected.map(file => file.path);
-    const files = (await this.run('git', ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', 'HEAD'])).stdout.split('\0').filter(Boolean);
-    if (parent.stdout.trim() !== head || !files.length || files.some(file => !paths.some(path => samePath(path, file)))) {
+  /**
+   * Judges `commit`, the commit just made on `head`, from the expected files; nothing here reverts it, since history is never rewritten.
+   * Uses the SHA, not the symbolic HEAD: the developer may commit while the typecheck below runs.
+   */
+  private async committedResult(head: string, commit: string, expected: Array<{ path: string; content: string }>, tsc: string, tsconfig: string, full: string): Promise<Result<'committed' | 'error'>> {
+    const parent = await this.run('git', ['rev-parse', '--verify', `${commit}^`]), paths = expected.map(file => file.path);
+    const files = (await this.run('git', ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', commit])).stdout.split('\0').filter(Boolean);
+    // The count check matters on Windows: case variants of one path would each pass samePath.
+    if (parent.stdout.trim() !== head || !files.length || files.length > paths.length || files.some(file => !paths.some(path => samePath(path, file)))) {
       return { status: 'error', diagnostics: [`commit_scope_violation: HEAD is not a commit of only the expected paths on the pre-commit HEAD; nothing was reverted: ${files.join(', ') || 'no paths'}`], changedFiles: files };
     }
     const left = await this.changedPaths() ?? ['(Git status unavailable)'];
     const leftDiagnostics = left.length ? [`hooks_left_changes: hooks left uncommitted changes that were not touched: ${left.join(', ')}`] : [];
     // Plain blob bytes as UTF-8: with core.autocrlf the blob is normalized, so a CRLF file shows as modified rather than slipping through.
     // Git's own spelling: tree lookups are case-sensitive even on Windows.
-    const blobs = await Promise.all(expected.map(file => this.run('git', ['show', `HEAD:${files.find(path => samePath(path, file.path)) ?? file.path}`])));
+    const blobs = await Promise.all(expected.map(file => this.run('git', ['show', `${commit}:${files.find(path => samePath(path, file.path)) ?? file.path}`])));
     const modified = expected.filter((file, index) => blobs[index].code !== 0 || blobs[index].stdout !== file.content);
     if (!modified.length) return { status: 'committed', diagnostics: leftDiagnostics, changedFiles: paths };
     const diff = capped('hooks_modified: hooks changed committed files; diff expected -> committed',
@@ -396,11 +400,13 @@ export class SessionStore {
             const commit = added.code !== 0 ? added
               : await this.run('git', ['commit', '-m', `test: ${base === null ? 'add' : 'update'} ${candidate.path}`, '-m', `${CANDIDATE_TRAILER}: ${candidateId}`]);
             // A killed or timed-out git (e.g. a slow post-commit hook) may still have created the commit: HEAD decides, not the exit code.
-            const moved = commit.code !== 0 && added.code === 0 && (await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() !== committingHead;
+            // Captured at once: later checks and postprocess must judge this commit even if the developer commits meanwhile.
+            const created = added.code === 0 ? (await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() : committingHead;
+            const moved = commit.code !== 0 && created !== committingHead;
             if (commit.code === 0 || moved) {
               // Every post-commit outcome is final: the commit stays in history and a retry must not commit again.
-              const judged = await this.committedResult(committingHead, [candidate], tsc, tsconfig, full);
-              if (judged.status === 'committed') candidate.rawCommit = (await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim();
+              const judged = await this.committedResult(committingHead, created, [candidate], tsc, tsconfig, full);
+              if (judged.status === 'committed') candidate.rawCommit = created;
               candidate.applyResult = moved ? { ...judged, diagnostics: ['commit_exit_nonzero: git reported a failure after creating the commit; the commit was kept.', ...commandDiagnostics(commit), ...judged.diagnostics] } : judged;
               journal(candidate.applyResult.status === 'committed' ? 'committed' : 'error');
               return candidate.applyResult;
@@ -475,7 +481,6 @@ export class SessionStore {
     try {
       const dirty = await this.changedPaths();
       if (!dirty) return outcome('error', 'git_unavailable: the workspace must be the root of a Git repository and git must be runnable.');
-      ({ state, candidate, raw } = committed()); // re-read: the session may have changed while Git ran
       if ((await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() !== raw) {
         return outcome('conflict', 'head_moved: postprocess runs only directly on top of the raw commit, and HEAD has moved since candidate_apply.');
       }
@@ -483,6 +488,11 @@ export class SessionStore {
       const paths = (await this.run('git', ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', raw])).stdout.split('\0').filter(Boolean);
       const missing = paths.filter(path => { try { return !statSync(this.safePath(path, true)).isFile(); } catch { return true; } });
       if (!paths.length || missing.length) return outcome('error', `raw_paths_unavailable: every path of the raw commit must be a regular file: ${missing.join(', ') || 'no paths'}`);
+      // Defence in depth: never format a commit that is not this candidate's single-target raw commit.
+      const rawMessage = (await this.run('git', ['log', '-1', '--format=%B', raw])).stdout;
+      if (paths.length !== 1 || !samePath(paths[0], candidate.path) || !rawMessage.includes(`${CANDIDATE_TRAILER}: ${candidate.id}`)) {
+        return outcome('error', `raw_commit_mismatch: the recorded raw commit is not this candidate's single-target commit; nothing was changed: ${paths.join(', ') || 'no paths'}`);
+      }
       const tools = names.map(name => ({ name, bin: this.packageBin(name) ?? '' }));
       const unresolved = tools.filter(tool => !tool.bin).map(tool => tool.name);
       if (unresolved.length) return outcome('error', `tool_not_found: the workspace must resolve its own ${unresolved.join(', ')} package with a bin entry.`);
@@ -490,6 +500,8 @@ export class SessionStore {
       if (!tsc) return outcome('error', 'typescript_not_found: the workspace must resolve its own typescript package.');
       const journal = (phase: ApplyPhase, formatted?: Record<string, string>): void => { state.apply = { candidateId: candidate.id, phase, formatted }; this.save(state); };
       const final = (result: PostprocessResult, phase: ApplyPhase): PostprocessResult => { candidate.postprocessResult = result; journal(phase); return result; };
+      // Re-read after the last await, so the busy journal saved next cannot overwrite a concurrent context_set, review or chat.
+      ({ state, candidate } = committed());
       journal('postprocessing');
       try {
         const notes: string[] = [];
@@ -528,9 +540,10 @@ export class SessionStore {
             const commit = added.code !== 0 ? added
               : await this.run('git', ['commit', '-m', `style: format ${candidate.path}`, '-m', `${POSTPROCESS_TRAILER}: ${candidate.id}`]);
             // As in candidateApply: HEAD, not the exit code, decides whether a commit exists.
-            const moved = commit.code !== 0 && added.code === 0 && (await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() !== raw;
+            const created = added.code === 0 ? (await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() : raw;
+            const moved = commit.code !== 0 && created !== raw;
             if (commit.code === 0 || moved) {
-              const judged = await this.committedResult(raw, after, tsc, tsconfig, full);
+              const judged = await this.committedResult(raw, created, after, tsc, tsconfig, full);
               const prefix = moved ? ['commit_exit_nonzero: git reported a failure after creating the commit; the commit was kept.', ...commandDiagnostics(commit)] : [];
               return final({ ...judged, diagnostics: [...prefix, ...judged.diagnostics, ...notes] }, judged.status === 'committed' ? 'postprocessed' : 'error');
             }

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 import { fixture, PASSING } from './git-fixture.mjs';
 
 const FORMATTED = PASSING.replaceAll('"', "'");
@@ -111,6 +112,40 @@ test('postprocess is refused without a raw commit or trusted tool list, and is a
   assert.deepEqual(f.dirty(), []);
 });
 
+test('a recorded raw commit that is not the candidate\'s own commit is never formatted', async (t) => {
+  const { f, store, id } = await rawCommit(t, { prettier: [QUOTES] });
+  store.close();
+  writeFileSync(join(f.root, 'source.ts'), 'export const value = 2;\n');
+  f.run('commit', '-q', '-am', 'developer commit');
+  const developer = f.head();
+  // Simulates the race the SHA capture closes: rawCommit pointing at a developer commit made during the apply.
+  const db = new DatabaseSync(join(f.root, '.stateful-worker', 'state.sqlite'));
+  const state = JSON.parse(db.prepare('SELECT state FROM sessions WHERE id = ?').get(id).state);
+  state.candidates[0].rawCommit = developer;
+  db.prepare('UPDATE sessions SET state = ? WHERE id = ?').run(JSON.stringify(state), id);
+  db.close();
+  const result = await f.open('tsconfig.json', 'prettier').postprocess(id);
+  assert.equal(result.status, 'error');
+  assert.match(result.diagnostics.join('\n'), /raw_commit_mismatch/);
+  assert.equal(f.head(), developer);
+  assert.equal(readFileSync(join(f.root, 'source.ts'), 'utf8'), 'export const value = 2;\n');
+  assert.deepEqual(f.dirty(), []);
+});
+
+test('a hook that refuses the style commit leaves the raw commit and file as they were, and postprocess can run again', async (t) => {
+  const { f, store, id, raw } = await rawCommit(t, { prettier: [QUOTES] });
+  f.hook('echo style refused >&2; exit 1');
+  const refused = await store.postprocess(id);
+  assert.equal(refused.status, 'failed');
+  assert.match(refused.diagnostics.join('\n'), /commit_failed[\s\S]*style refused/);
+  assert.equal(f.head(), raw);
+  assert.equal(readFileSync(f.target, 'utf8'), PASSING);
+  assert.deepEqual(f.dirty(), []);
+  f.unhook();
+  assert.equal((await store.postprocess(id)).status, 'committed');
+  assert.equal(f.committed(raw).blob, FORMATTED);
+});
+
 test('eslint exit 1 keeps its fixes after prettier with lint_problems_remain; exit 2 returns the file to the raw commit', async (t) => {
   const lint = await rawCommit(t, { prettier: [QUOTES], eslint: [LINT, { exit: 1, extra: "console.log('1 problem remains');" }] });
   const result = await lint.store.postprocess(lint.id);
@@ -142,6 +177,18 @@ test('crash recovery returns formatted files to the raw commit unless changed, a
     assert.equal(status.details.errors.at(-1).code, 'postprocess_interrupted');
     if (written === FORMATTED) assert.equal((await store.postprocess(id)).status, 'committed');
   }
+
+  // Crash while committing before Git created the commit: the staged formatted file is unstaged and returned to the raw commit.
+  const staged = await rawCommit(t, { prettier: [QUOTES] });
+  staged.store.close();
+  writeFileSync(staged.f.target, FORMATTED);
+  staged.f.run('add', '--', 'value.test.ts');
+  staged.f.journal(staged.id, { candidateId: staged.c, phase: 'postprocess_committing', formatted: { 'value.test.ts': sha256(FORMATTED) } });
+  const reopened = staged.f.open('tsconfig.json', 'prettier');
+  assert.equal(reopened.status(staged.id).phase, 'postprocess_failed');
+  assert.equal(readFileSync(staged.f.target, 'utf8'), PASSING);
+  assert.deepEqual(staged.f.dirty(), []);
+  assert.equal(staged.f.head(), staged.raw);
 
   let { f, store, id, c, raw } = await rawCommit(t, { prettier: [QUOTES] });
   store.close();
