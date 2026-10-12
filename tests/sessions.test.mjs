@@ -146,7 +146,7 @@ test('existing I1 session records gain candidate fields without losing revision 
 });
 
 test('plain/malformed/path-mismatched/blank responses preserve raw history without creating candidates', async (t) => {
-  for (const raw of ['plain answer', JSON.stringify({ path: '../other.test.ts', content: 'code' }), JSON.stringify({ path: 'value.test.ts', content: '  \n' })]) {
+  for (const raw of ['plain answer', JSON.stringify({ path: '../other.test.ts', content: 'code' }), JSON.stringify({ path: 'value.test.ts', content: '  \n' }), JSON.stringify({ path: 'value.test.ts', content: 'я'.repeat(16001) })]) {
     const f = await fixture(t, res => res.end(JSON.stringify({ choices: [{ message: { content: raw }, finish_reason: 'stop' }] })));
     const store = f.open(), id = start(store);
     store.contextSet(id, context);

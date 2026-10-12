@@ -1,11 +1,21 @@
+import { execFile } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
-import { lstatSync, mkdirSync, realpathSync, statSync, openSync, fstatSync, readSync, closeSync, type BigIntStats } from 'node:fs';
-import { dirname, isAbsolute, join, relative, parse } from 'node:path';
+import { lstatSync, mkdirSync, realpathSync, statSync, openSync, fstatSync, readSync, closeSync, unlinkSync, writeFileSync, type BigIntStats } from 'node:fs';
+import { createRequire } from 'node:module';
+import { basename, dirname, isAbsolute, join, relative, parse } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { chat, type WorkerConfig } from './worker.js';
 import { z } from 'zod';
 
 const HARD_BUDGET = 32_000, WARNING_BUDGET = 24_000, OUTPUT_RESERVE = 8192;
+// shortcut: one fixed timeout for git and tsc; make it configurable when real projects need longer typechecks.
+const COMMAND_TIMEOUT_MS = 300_000, COMMAND_OUTPUT_LIMIT = 16 * 1024 * 1024, DIAGNOSTIC_LIMIT = 8000;
+const STORE_DIR = '.stateful-worker';
+// tsc must not write: --noEmit alone still writes .tsbuildinfo for incremental/composite projects (verified on TS 7.0.2).
+const TYPECHECK_FLAGS = ['--noEmit', '--incremental', 'false', '--composite', 'false'];
+type ApplyPhase = 'applying' | 'validating' | 'validated' | 'restored' | 'conflict' | 'error';
+export type ApplyResult = { status: 'validated' | 'validation_failed' | 'conflict' | 'no_changes' | 'error'; diagnostics: string[]; changedFiles: string[] };
+interface CommandResult { code: number | string; stdout: string; stderr: string }
 interface Snapshot { path: string; content: string; contentHash: string; estimatedTokens: number }
 interface Turn { role: 'supervisor' | 'worker'; text: string; contextRevision: number }
 interface StoredError { code: string; message: string; contextRevision: number }
@@ -15,23 +25,32 @@ interface Candidate {
   readonly contextRevision: number; readonly base: Snapshot | null;
   state: 'draft' | 'approved' | 'rejected'; findings: ReviewFinding[];
   reviews: Array<{ verdict: 'approve' | 'reject'; findings: ReviewFinding[]; contextRevision: number }>;
+  applyResult?: ApplyResult;
 }
 const artifactSchema = z.object({ path: z.string(), content: z.string().refine(value => value.trim().length > 0) }).strict();
 interface Session {
   id: string; workspaceRoot: string; objective: string; allowedPaths: string[];
   brief: string; acceptanceCriteria: string[]; contextRevision: number;
   context: Snapshot[]; turns: Turn[]; errors: StoredError[]; pending: boolean; candidates: Candidate[];
+  apply?: { candidateId: string; phase: ApplyPhase };
 }
 interface ContextInput { files: string[]; brief: string; acceptanceCriteria: string[] }
 export class SessionError extends Error {
   constructor(public readonly code: string, message: string) { super(message); }
 }
+const applying = (state: Session): boolean => state.apply?.phase === 'applying' || state.apply?.phase === 'validating';
+const outcome = (status: ApplyResult['status'], ...diagnostics: string[]): ApplyResult => ({ status, diagnostics, changedFiles: [] });
+const capped = (label: string, text: string): string => text.length <= DIAGNOSTIC_LIMIT ? `${label}: ${text}`
+  : `${label} (truncated to first ${DIAGNOSTIC_LIMIT} of ${text.length} chars): ${text.slice(0, DIAGNOSTIC_LIMIT)}`;
+const commandDiagnostics = (result: CommandResult): string[] => [`exit code: ${result.code}`, capped('stdout', result.stdout), capped('stderr', result.stderr)];
+const samePath = (first: string, second: string): boolean => process.platform === 'win32' ? first.toLowerCase() === second.toLowerCase() : first === second;
 
 export class SessionStore {
   private readonly db: DatabaseSync;
   private readonly root: string;
   private closed = false;
-  constructor(workspaceRoot: string, private readonly config: WorkerConfig) {
+  private applyRunning = false;
+  constructor(workspaceRoot: string, private readonly config: WorkerConfig, private readonly tsconfig?: string) {
     if (!isAbsolute(workspaceRoot)) throw new SessionError('configuration_error', 'Workspace path must be absolute.');
     let database: DatabaseSync | undefined;
     try {
@@ -49,6 +68,11 @@ export class SessionStore {
         const state: Session = JSON.parse(String(row.state));
         state.pending = false;
         this.recordError(state, new SessionError('interrupted', 'Previous inference was interrupted; no request was replayed.'));
+      }
+      for (const row of this.db.prepare("SELECT state FROM sessions WHERE json_extract(state, '$.apply.phase') IN ('applying', 'validating')").all()) {
+        const state: Session = JSON.parse(String(row.state)), apply = state.apply!;
+        apply.phase = this.restore(this.candidate(state, apply.candidateId));
+        this.recordError(state, new SessionError('apply_interrupted', `Previous apply was interrupted; target ${apply.phase === 'restored' ? 'is at its base' : 'changed externally and was left untouched'}; validation was not replayed.`));
       }
     } catch (error: unknown) {
       database?.close();
@@ -74,7 +98,7 @@ export class SessionStore {
   }
   private ready(id: string): Session {
     const state = this.load(id);
-    if (state.pending) throw new SessionError('session_busy', 'Session is busy with an inference.');
+    if (state.pending || applying(state)) throw new SessionError('session_busy', 'Session is busy with an inference or apply.');
     return state;
   }
   private recordError(state: Session, error: SessionError): void {
@@ -114,8 +138,8 @@ export class SessionStore {
       outputContract: { instruction: 'Return exactly one JSON object with path and content; no Markdown or additional fields. Content must be the complete test file.', path: state.allowedPaths[0].replaceAll('\\', '/') },
       currentMessage: message });
   }
-  private targetBase(state: Session): Snapshot | null {
-    const path = state.allowedPaths[0], full = this.safePath(path, false);
+  private targetBase(path: string): Snapshot | null {
+    const full = this.safePath(path, false);
     if (!lstatSync(full, { throwIfNoEntry: false })) return null;
     const stat = statSync(full, { bigint: true });
     if (!stat.isFile()) throw new SessionError('invalid_path', 'Target base must be a regular file.');
@@ -138,6 +162,8 @@ export class SessionStore {
     if (!parsed.success) throw new SessionError('invalid_candidate', 'Artifact must contain only path and nonblank complete content; no candidate created.');
     const path = state.allowedPaths[0].replaceAll('\\', '/');
     if (parsed.data.path !== path) throw new SessionError('invalid_candidate_path', 'Artifact path differs from the allowed target; no candidate created.');
+    // Apply and restore compare files through budget-limited reads, so a larger candidate could never be recognised and restored.
+    if (Buffer.byteLength(parsed.data.content, 'utf8') > HARD_BUDGET) throw new SessionError('invalid_candidate', `Artifact exceeds ${HARD_BUDGET} bytes; no candidate created.`);
     const id = randomUUID();
     state.candidates.push({ id, path, content: parsed.data.content, base,
       diff: this.replacementDiff(path, base?.content ?? null, parsed.data.content), contextRevision: state.contextRevision,
@@ -164,6 +190,109 @@ export class SessionStore {
     candidate.reviews.push({ verdict, findings, contextRevision: state.contextRevision });
     this.save(state);
     return { state: candidate.state };
+  }
+  private matches(path: string, expected: string | null): boolean {
+    // Unreadable, oversized or unsafe files never match: they are treated as foreign and left untouched.
+    try { return (this.targetBase(path)?.content ?? null) === expected; } catch { return false; }
+  }
+  private restore(candidate: Candidate): 'restored' | 'conflict' {
+    const base = candidate.base?.content ?? null;
+    if (!this.matches(candidate.path, candidate.content)) return this.matches(candidate.path, base) ? 'restored' : 'conflict';
+    // shortcut: compare-then-write leaves a small race with external editors; Git status checks catch most of it.
+    const full = this.safePath(candidate.path, false);
+    if (base === null) unlinkSync(full); else writeFileSync(full, base);
+    return 'restored';
+  }
+  private run(file: string, args: string[]): Promise<CommandResult> {
+    // Windows env names are case-insensitive, so the key must be dropped under any spelling.
+    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => name.toUpperCase() !== 'HARNESS_MODEL_API_KEY'));
+    return new Promise(resolve => execFile(file, args, { cwd: this.root, env, timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_OUTPUT_LIMIT, windowsHide: true },
+      (error, stdout, stderr) => resolve({ code: !error ? 0 : error.killed ? `killed (${error.signal ?? 'timeout or output limit'})` : error.code ?? 'failed', stdout, stderr })));
+  }
+  /** Changed paths outside the store directory, or null when the workspace is not the root of a usable Git repository. */
+  private async changedPaths(): Promise<string[] | null> {
+    const top = await this.run('git', ['rev-parse', '--show-toplevel']);
+    if (top.code !== 0 || !samePath(realpathSync(top.stdout.trim()), this.root)) return null;
+    const status = await this.run('git', ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
+    if (status.code !== 0) return null;
+    const fields = status.stdout.split('\0'), paths: string[] = [];
+    for (let index = 0; index < fields.length; index++) {
+      if (!fields[index]) continue;
+      paths.push(fields[index].slice(3));
+      if (/^([RC].|.[RC])/.test(fields[index])) paths.push(fields[++index]); // rename/copy entries carry the source path as the next field
+    }
+    return paths.filter(path => path !== STORE_DIR && !path.startsWith(`${STORE_DIR}/`));
+  }
+  async candidateApply(id: string, candidateId: string): Promise<ApplyResult> {
+    const approved = (): { state: Session; candidate: Candidate } => {
+      const state = this.ready(id), candidate = this.candidate(state, candidateId);
+      if (candidate.contextRevision !== state.contextRevision) throw new SessionError('stale_candidate', 'Candidate is stale; generate and review a new version on the current revision.');
+      if (candidate.state !== 'approved') throw new SessionError('candidate_not_approved', 'Only an approved candidate can be applied; review this exact version first.');
+      return { state, candidate };
+    };
+    let { state, candidate } = approved();
+    const stored = candidate.applyResult;
+    if (stored && (stored.status !== 'validated' || this.matches(candidate.path, candidate.content))) return stored;
+    if (this.applyRunning || this.db.prepare("SELECT 1 FROM sessions WHERE json_extract(state, '$.apply.phase') IN ('applying', 'validating')").get()) {
+      throw new SessionError('apply_busy', 'Another apply is in progress in this workspace.');
+    }
+    if (!this.tsconfig?.trim()) throw new SessionError('configuration_error', 'Missing WORKER_TSCONFIG: candidate_apply needs a trusted workspace-relative tsconfig.');
+    const tsconfig = this.safePath(this.tsconfig, true);
+    this.applyRunning = true;
+    try {
+      const dirty = await this.changedPaths();
+      if (!dirty) return outcome('error', 'git_unavailable: the workspace must be the root of a Git repository and git must be runnable.');
+      if (dirty.length) return outcome('conflict', `dirty_worktree: commit or remove changes first: ${dirty.join(', ')}`);
+      ({ state, candidate } = approved()); // re-read: the session may have changed while Git ran
+      const changedContext = state.context.filter(snapshot => !this.matches(snapshot.path, snapshot.content)).map(snapshot => snapshot.path);
+      if (changedContext.length) return outcome('conflict', `context_changed: refresh context and regenerate: ${changedContext.join(', ')}`);
+      const base = candidate.base?.content ?? null;
+      if (!this.matches(candidate.path, base)) return outcome('conflict', `target_changed: ${candidate.path} differs from the generation-time base.`);
+      const full = this.safePath(candidate.path, false);
+      if (!statSync(dirname(full), { throwIfNoEntry: false })?.isDirectory()) return outcome('error', `missing_directory: parent of ${candidate.path} must already exist.`);
+      if (candidate.content === base) return outcome('no_changes');
+      let tsc: string;
+      try { tsc = join(dirname(createRequire(join(this.root, 'package.json')).resolve('typescript/package.json')), 'bin', 'tsc'); } catch {
+        return outcome('error', 'typescript_not_found: the workspace must resolve its own typescript package.');
+      }
+      const journal = (phase: ApplyPhase): void => { state.apply = { candidateId, phase }; this.save(state); };
+      journal('applying');
+      try {
+        writeFileSync(full, candidate.content, { flag: base === null ? 'wx' : 'w' });
+        journal('validating');
+        const listed = await this.run(process.execPath, [tsc, '--listFilesOnly', '-p', tsconfig]), target = realpathSync(full);
+        const included = listed.code === 0 && listed.stdout.split(/\r?\n/).some(line => line.trim() && samePath(basename(line.trim()), basename(target)) && samePath(realpathSync(line.trim()), target));
+        let failure: ApplyResult, final = false;
+        if (!included) {
+          failure = outcome('error', `target_not_in_typecheck: tsc --listFilesOnly -p ${this.tsconfig} does not include ${candidate.path}; a typecheck without the target is not validation.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed)));
+        } else {
+          const checked = await this.run(process.execPath, [tsc, ...TYPECHECK_FLAGS, '-p', tsconfig]);
+          if (checked.code === 0) {
+            const changed = await this.changedPaths() ?? [];
+            const foreign = changed.filter(path => !samePath(path, candidate.path));
+            if (foreign.length || !changed.length) {
+              journal('error');
+              return { status: 'error', diagnostics: [`unexpected_changes: validation passed but the worktree has changes besides the target; nothing was reverted: ${foreign.join(', ') || 'Git status unavailable'}`], changedFiles: changed };
+            }
+            candidate.applyResult = { status: 'validated', diagnostics: [], changedFiles: [candidate.path] };
+            journal('validated');
+            return candidate.applyResult;
+          }
+          // Only a real tsc exit code judges the candidate; a timeout, kill or spawn failure must not burn an approved candidate.
+          final = typeof checked.code === 'number';
+          failure = final ? outcome('validation_failed', ...commandDiagnostics(checked))
+            : outcome('error', 'typecheck_not_completed: tsc did not finish; the candidate can be applied again.', ...commandDiagnostics(checked));
+        }
+        const restored = this.restore(candidate) === 'restored';
+        if (!restored) failure = outcome('conflict', ...failure.diagnostics, `restore_conflict: ${candidate.path} changed during validation and was left untouched.`);
+        if (final) candidate.applyResult = failure; // a completed typecheck is final for this immutable candidate
+        journal(!restored ? 'conflict' : failure.status === 'error' ? 'error' : 'restored');
+        return failure;
+      } catch (error: unknown) {
+        journal(this.restore(candidate) === 'restored' ? 'error' : 'conflict');
+        throw error;
+      }
+    } finally { this.applyRunning = false; }
   }
   private sameFile(first: BigIntStats, second: BigIntStats): boolean {
     return first.dev === second.dev && first.ino === second.ino && first.size === second.size
@@ -244,7 +373,7 @@ export class SessionStore {
     try {
       if (!state.contextRevision || !state.brief.trim() || !state.context.length) throw new SessionError('context_not_ready', 'Set context before inference.');
       const prompt = this.prompt(state, message), budget = this.budget(prompt);
-      const base = this.targetBase(state);
+      const base = this.targetBase(state.allowedPaths[0]);
       state.pending = true;
       state.turns.push({ role: 'supervisor', text: message, contextRevision: state.contextRevision });
       this.save(state);
@@ -270,9 +399,10 @@ export class SessionStore {
   }
   status(id: string): { phase: string; contextRevision: number; latestCandidateId?: string; pendingAction?: string; details: Session } {
     const state = this.load(id);
-    const latest = state.candidates.at(-1);
-    return { phase: state.pending ? 'chatting' : latest?.contextRevision === state.contextRevision ? ({ approved: 'approved', rejected: 'needs_revision', draft: 'review' } as const)[latest.state] : 'draft', contextRevision: state.contextRevision,
-      ...(latest ? { latestCandidateId: latest.id } : {}),
-      ...(state.pending ? { pendingAction: 'wait_for_inference' } : {}), details: state };
+    const latest = state.candidates.at(-1), current = latest?.contextRevision === state.contextRevision ? latest : undefined;
+    const reviewPhase = current ? ({ approved: 'approved', rejected: 'needs_revision', draft: 'review' } as const)[current.state] : 'draft';
+    return { phase: state.pending ? 'chatting' : state.apply && (applying(state) || state.apply.candidateId === current?.id) ? state.apply.phase : reviewPhase,
+      contextRevision: state.contextRevision, ...(latest ? { latestCandidateId: latest.id } : {}),
+      ...(state.pending ? { pendingAction: 'wait_for_inference' } : applying(state) ? { pendingAction: 'wait_for_apply' } : {}), details: state };
   }
 }

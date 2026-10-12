@@ -20,7 +20,7 @@ server.registerTool('worker_diagnostics', {
 }, () => {
   try {
     const config = readConfig();
-    return result({ configured: true, model: config.model, timeoutMs: config.timeoutMs, stage: 'I2' });
+    return result({ configured: true, model: config.model, timeoutMs: config.timeoutMs, stage: 'I3' });
   } catch (error: unknown) {
     if (!(error instanceof ConfigurationError)) throw error;
     return result({ configured: false, error: { code: 'configuration_error', message: error.message } }, true);
@@ -46,7 +46,7 @@ async function sessionResult(operation: (store: SessionStore) => Record<string, 
     if (!sessions) {
       const root = process.env.WORKER_WORKSPACE_ROOT;
       if (!root) throw new ConfigurationError('Missing WORKER_WORKSPACE_ROOT.');
-      sessions = new SessionStore(root, readConfig());
+      sessions = new SessionStore(root, readConfig(), process.env.WORKER_TSCONFIG);
     }
     return result(await operation(sessions));
   } catch (error: unknown) {
@@ -92,5 +92,13 @@ server.registerTool('candidate_review', {
   inputSchema: z.object({ sessionId: text, candidateId: text, verdict: z.enum(['approve', 'reject']),
     findings: z.array(z.object({ severity: z.enum(['blocker', 'major', 'minor']), message: text, location: text.optional() }).strict()) }).strict(),
 }, ({ sessionId, candidateId, verdict, findings }) => sessionResult(store => store.candidateReview(sessionId, candidateId, verdict, findings)));
+
+server.registerTool('candidate_apply', {
+  description: 'Write one approved, current-revision candidate into a clean Git workspace and typecheck it with the workspace tsc and trusted WORKER_TSCONFIG (must include the target). '
+    + 'Returns status validated (file left written, no commit yet), validation_failed (diagnostics, file restored), conflict (dirty tree, changed snapshots/target or external edit; nothing overwritten), no_changes or error. '
+    + 'Session/candidate refusals (not approved, stale, busy, missing configuration) are tool errors with a code and write nothing. A failed candidate is final: generate and review a new one.',
+  inputSchema: z.object({ sessionId: text, candidateId: text }).strict(),
+  annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
+}, ({ sessionId, candidateId }) => sessionResult(store => store.candidateApply(sessionId, candidateId)));
 
 await server.connect(new StdioServerTransport());
