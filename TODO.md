@@ -36,6 +36,20 @@
 - [ ] Run apply/validation from corporate Kilo on a real pilot module with its own test tsconfig (developer with corporate Kilo).
 - [ ] Known limits: compare-then-write restore race; `typescript` may resolve from a hoisted `node_modules` outside the workspace; untested timeout branch (needs a configurable timeout or fake compiler).
 
+## I4 — raw commit and postprocess
+
+- [x] Commit the validated target alone with hooks enabled and a candidate trailer; verify scope and committed content; re-typecheck when hooks changed the file (user decision, 2026-10-13).
+- [x] Keep any commit made after the pre-apply HEAD on failures and crashes; never reset, amend or push.
+- [x] Complete the independent review of the raw commit and fix confirmed findings (`npm test`: 41 passed).
+- [ ] Implement `postprocess`: trusted Prettier/ESLint fix only on raw-commit paths, re-typecheck, separate commit or `no_changes`.
+- [ ] Untested branch: git exits non-zero after creating the commit (needs a reliable way to kill git after the commit in tests).
+
+## Contract updates (user decisions, 2026-10-13)
+
+- [x] Require the agreed scenario list in `context_set` `acceptanceCriteria`; the worker prompt asks to implement exactly that list; the role sends it before generation.
+- [x] Return a new candidate's code from `worker_chat` (`artifact`) instead of the raw JSON reply; `candidate_read` stays for diffs, history and restarts.
+- [x] Input budget 64K tokens of the 96K window, estimated as UTF-8 bytes / 3 + 256; files and candidates up to 192000 bytes.
+
 ## Deployment/pilot checks
 
 - [ ] Verify target Qwen3-Next access, tokenizer/window and quality in the corporate environment; does not block local I1 by user decision.
@@ -44,5 +58,5 @@
 ## Later gates
 
 - [x] Begin I1 locally with `gpt-6-luna` after the user's scope decision.
-- [ ] Before I4, decide how to preserve raw generated code when repository hooks modify files; never bypass hooks.
+- [x] Before I4, decide how to preserve raw generated code when repository hooks modify files; never bypass hooks (re-typecheck and report `hooksModified`).
 - [ ] Follow I1–I6 in `IMPLEMENTATION_PLAN.md`; do not add stateful features to I0.
