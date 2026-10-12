@@ -95,8 +95,10 @@ server.registerTool('candidate_review', {
 
 server.registerTool('candidate_apply', {
   description: 'Write one approved, current-revision candidate into a clean Git workspace and typecheck it with the workspace tsc and trusted WORKER_TSCONFIG (must include the target). '
-    + 'Returns status validated (file left written, no commit yet), validation_failed (diagnostics, file restored), conflict (dirty tree, changed snapshots/target or external edit; nothing overwritten), no_changes or error. '
-    + 'Session/candidate refusals (not approved, stale, busy, missing configuration) are tool errors with a code and write nothing. A failed candidate is final: generate and review a new one.',
+    + 'On success stages only the target and creates one local commit with Git hooks enabled (no push). '
+    + 'Returns status committed (hooksModified: true plus a candidate->committed diff when hooks changed the file and it passed the typecheck again), validation_failed (diagnostics, file restored), conflict (dirty tree, changed snapshots/target or external edit; nothing overwritten), no_changes or error. '
+    + 'Error commit_failed (e.g. a hook refused) restores the file and may be retried; commit_scope_violation and hooks_broke_typecheck keep the commit and are final. '
+    + 'Session/candidate refusals (not approved, stale, busy, missing configuration) are tool errors with a code and write nothing. A failed typecheck is final: generate and review a new one. Repeating a finished apply returns the stored result without a new commit.',
   inputSchema: z.object({ sessionId: text, candidateId: text }).strict(),
   annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, ({ sessionId, candidateId }) => sessionResult(store => store.candidateApply(sessionId, candidateId)));

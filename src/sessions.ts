@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { lstatSync, mkdirSync, realpathSync, statSync, openSync, fstatSync, readSync, closeSync, unlinkSync, writeFileSync, type BigIntStats } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -13,8 +13,10 @@ const COMMAND_TIMEOUT_MS = 300_000, COMMAND_OUTPUT_LIMIT = 16 * 1024 * 1024, DIA
 const STORE_DIR = '.stateful-worker';
 // tsc must not write: --noEmit alone still writes .tsbuildinfo for incremental/composite projects (verified on TS 7.0.2).
 const TYPECHECK_FLAGS = ['--noEmit', '--incremental', 'false', '--composite', 'false'];
-type ApplyPhase = 'applying' | 'validating' | 'validated' | 'restored' | 'conflict' | 'error';
-export type ApplyResult = { status: 'validated' | 'validation_failed' | 'conflict' | 'no_changes' | 'error'; diagnostics: string[]; changedFiles: string[] };
+// Recovery finds the raw commit of an interrupted apply by this trailer instead of exposing SHAs.
+const CANDIDATE_TRAILER = 'Stateful-Worker-Candidate';
+type ApplyPhase = 'applying' | 'validating' | 'committing' | 'committed' | 'restored' | 'conflict' | 'error';
+export type ApplyResult = { status: 'committed' | 'validation_failed' | 'conflict' | 'no_changes' | 'error'; diagnostics: string[]; changedFiles: string[]; hooksModified?: true };
 interface CommandResult { code: number | string; stdout: string; stderr: string }
 interface Snapshot { path: string; content: string; contentHash: string; estimatedTokens: number }
 interface Turn { role: 'supervisor' | 'worker'; text: string; contextRevision: number }
@@ -32,13 +34,16 @@ interface Session {
   id: string; workspaceRoot: string; objective: string; allowedPaths: string[];
   brief: string; acceptanceCriteria: string[]; contextRevision: number;
   context: Snapshot[]; turns: Turn[]; errors: StoredError[]; pending: boolean; candidates: Candidate[];
-  apply?: { candidateId: string; phase: ApplyPhase };
+  apply?: { candidateId: string; phase: ApplyPhase; head?: string };
 }
 interface ContextInput { files: string[]; brief: string; acceptanceCriteria: string[] }
 export class SessionError extends Error {
   constructor(public readonly code: string, message: string) { super(message); }
 }
-const applying = (state: Session): boolean => state.apply?.phase === 'applying' || state.apply?.phase === 'validating';
+const BUSY_PHASES = "('applying', 'validating', 'committing')";
+const applying = (state: Session): boolean => ['applying', 'validating', 'committing'].includes(state.apply?.phase ?? '');
+// Windows env names are case-insensitive, so the key must be dropped under any spelling.
+const commandEnv = (): NodeJS.ProcessEnv => Object.fromEntries(Object.entries(process.env).filter(([name]) => name.toUpperCase() !== 'HARNESS_MODEL_API_KEY'));
 const outcome = (status: ApplyResult['status'], ...diagnostics: string[]): ApplyResult => ({ status, diagnostics, changedFiles: [] });
 const capped = (label: string, text: string): string => text.length <= DIAGNOSTIC_LIMIT ? `${label}: ${text}`
   : `${label} (truncated to first ${DIAGNOSTIC_LIMIT} of ${text.length} chars): ${text.slice(0, DIAGNOSTIC_LIMIT)}`;
@@ -69,10 +74,11 @@ export class SessionStore {
         state.pending = false;
         this.recordError(state, new SessionError('interrupted', 'Previous inference was interrupted; no request was replayed.'));
       }
-      for (const row of this.db.prepare("SELECT state FROM sessions WHERE json_extract(state, '$.apply.phase') IN ('applying', 'validating')").all()) {
-        const state: Session = JSON.parse(String(row.state)), apply = state.apply!;
-        apply.phase = this.restore(this.candidate(state, apply.candidateId));
-        this.recordError(state, new SessionError('apply_interrupted', `Previous apply was interrupted; target ${apply.phase === 'restored' ? 'is at its base' : 'changed externally and was left untouched'}; validation was not replayed.`));
+      for (const row of this.db.prepare(`SELECT state FROM sessions WHERE json_extract(state, '$.apply.phase') IN ${BUSY_PHASES}`).all()) {
+        const state: Session = JSON.parse(String(row.state)), apply = state.apply!, candidate = this.candidate(state, apply.candidateId);
+        apply.phase = apply.phase === 'committing' ? this.recoverCommit(candidate, apply.head ?? '') : this.restore(candidate);
+        const outcomes = { committed: 'its commit exists and was kept', restored: 'target is at its base', conflict: 'target changed externally or Git failed, so it was left untouched' };
+        this.recordError(state, new SessionError('apply_interrupted', `Previous apply was interrupted; ${outcomes[apply.phase as keyof typeof outcomes]}; validation was not replayed.`));
       }
     } catch (error: unknown) {
       database?.close();
@@ -204,10 +210,48 @@ export class SessionStore {
     return 'restored';
   }
   private run(file: string, args: string[]): Promise<CommandResult> {
-    // Windows env names are case-insensitive, so the key must be dropped under any spelling.
-    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => name.toUpperCase() !== 'HARNESS_MODEL_API_KEY'));
-    return new Promise(resolve => execFile(file, args, { cwd: this.root, env, timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_OUTPUT_LIMIT, windowsHide: true },
+    return new Promise(resolve => execFile(file, args, { cwd: this.root, env: commandEnv(), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_OUTPUT_LIMIT, windowsHide: true },
       (error, stdout, stderr) => resolve({ code: !error ? 0 : error.killed ? `killed (${error.signal ?? 'timeout or output limit'})` : error.code ?? 'failed', stdout, stderr })));
+  }
+  /** Sync because the constructor and the exception path need it: keeps an existing trailer commit, otherwise unstages and restores the target. */
+  private recoverCommit(candidate: Candidate, head: string): 'committed' | 'restored' | 'conflict' {
+    const git = (...args: string[]): string => execFileSync('git', args, { cwd: this.root, env: commandEnv(), encoding: 'utf8',
+      timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_OUTPUT_LIMIT, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+      if (git('rev-parse', 'HEAD').trim() !== head && git('rev-parse', 'HEAD^').trim() === head
+        && git('log', '-1', '--format=%B', 'HEAD').includes(`${CANDIDATE_TRAILER}: ${candidate.id}`)) {
+        candidate.applyResult = { status: 'committed', diagnostics: ['recovered_after_crash: the apply was interrupted after Git created its commit; the commit was kept and post-commit scope and hook checks were not replayed.'], changedFiles: [candidate.path] };
+        return 'committed';
+      }
+      git('--literal-pathspecs', 'restore', '--staged', '--', candidate.path);
+    } catch { return 'conflict'; }
+    return this.restore(candidate);
+  }
+  /** Runs tsc only when the trusted config includes the target; a typecheck without the target is not validation. */
+  private async typecheck(tsc: string, tsconfig: string, full: string): Promise<{ listed: CommandResult; checked?: CommandResult }> {
+    const listed = await this.run(process.execPath, [tsc, '--listFilesOnly', '-p', tsconfig]), target = realpathSync(full);
+    const included = listed.code === 0 && listed.stdout.split(/\r?\n/).some(line => line.trim() && samePath(basename(line.trim()), basename(target)) && samePath(realpathSync(line.trim()), target));
+    return { listed, checked: included ? await this.run(process.execPath, [tsc, ...TYPECHECK_FLAGS, '-p', tsconfig]) : undefined };
+  }
+  /** Judges the commit candidate_apply just made; nothing here reverts it, since history is never rewritten. */
+  private async committedResult(candidate: Candidate, head: string, tsc: string, tsconfig: string, full: string): Promise<ApplyResult> {
+    const parent = await this.run('git', ['rev-parse', '--verify', 'HEAD^']);
+    const files = (await this.run('git', ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', 'HEAD'])).stdout.split('\0').filter(Boolean);
+    if (parent.stdout.trim() !== head || files.length !== 1 || !samePath(files[0], candidate.path)) {
+      return { status: 'error', diagnostics: [`commit_scope_violation: HEAD is not a single-target commit on the pre-apply HEAD; nothing was reverted: ${files.join(', ') || 'no paths'}`], changedFiles: files };
+    }
+    const left = await this.changedPaths() ?? ['(Git status unavailable)'];
+    const leftDiagnostics = left.length ? [`hooks_left_changes: hooks left uncommitted changes that were not touched: ${left.join(', ')}`] : [];
+    // Plain blob bytes as UTF-8: with core.autocrlf the blob is normalized, so a CRLF candidate shows as modified rather than slipping through.
+    const blob = await this.run('git', ['show', `HEAD:${candidate.path}`]);
+    if (blob.code === 0 && blob.stdout === candidate.content) return { status: 'committed', diagnostics: leftDiagnostics, changedFiles: [candidate.path] };
+    const diff = capped('hooks_modified: hooks changed the committed target; diff candidate -> committed', this.replacementDiff(candidate.path, candidate.content, blob.stdout));
+    if (blob.code !== 0 || left.length) {
+      return { status: 'error', diagnostics: ['committed_unverified: hooks changed or removed the committed target and the worktree differs from HEAD, so the commit was not typechecked; nothing was reverted.', diff, ...leftDiagnostics], changedFiles: [candidate.path] };
+    }
+    const { listed, checked } = await this.typecheck(tsc, tsconfig, full);
+    if (checked?.code === 0) return { status: 'committed', diagnostics: [diff], changedFiles: [candidate.path], hooksModified: true };
+    return { status: 'error', diagnostics: ['hooks_broke_typecheck: the hook-modified commit fails the typecheck; it stays in history and nothing was reverted.', ...commandDiagnostics(checked ?? listed), diff], changedFiles: [candidate.path] };
   }
   /** Changed paths outside the store directory, or null when the workspace is not the root of a usable Git repository. */
   private async changedPaths(): Promise<string[] | null> {
@@ -231,9 +275,9 @@ export class SessionStore {
       return { state, candidate };
     };
     let { state, candidate } = approved();
-    const stored = candidate.applyResult;
-    if (stored && (stored.status !== 'validated' || this.matches(candidate.path, candidate.content))) return stored;
-    if (this.applyRunning || this.db.prepare("SELECT 1 FROM sessions WHERE json_extract(state, '$.apply.phase') IN ('applying', 'validating')").get()) {
+    // Only final outcomes are stored (a completed failed typecheck or an existing commit), so a repeat never touches Git or tsc.
+    if (candidate.applyResult) return candidate.applyResult;
+    if (this.applyRunning || this.db.prepare(`SELECT 1 FROM sessions WHERE json_extract(state, '$.apply.phase') IN ${BUSY_PHASES}`).get()) {
       throw new SessionError('apply_busy', 'Another apply is in progress in this workspace.');
     }
     if (!this.tsconfig?.trim()) throw new SessionError('configuration_error', 'Missing WORKER_TSCONFIG: candidate_apply needs a trusted workspace-relative tsconfig.');
@@ -255,29 +299,41 @@ export class SessionStore {
       try { tsc = join(dirname(createRequire(join(this.root, 'package.json')).resolve('typescript/package.json')), 'bin', 'tsc'); } catch {
         return outcome('error', 'typescript_not_found: the workspace must resolve its own typescript package.');
       }
-      const journal = (phase: ApplyPhase): void => { state.apply = { candidateId, phase }; this.save(state); };
+      const journal = (phase: ApplyPhase, head?: string): void => { state.apply = { candidateId, phase, head }; this.save(state); };
       journal('applying');
       try {
         writeFileSync(full, candidate.content, { flag: base === null ? 'wx' : 'w' });
         journal('validating');
-        const listed = await this.run(process.execPath, [tsc, '--listFilesOnly', '-p', tsconfig]), target = realpathSync(full);
-        const included = listed.code === 0 && listed.stdout.split(/\r?\n/).some(line => line.trim() && samePath(basename(line.trim()), basename(target)) && samePath(realpathSync(line.trim()), target));
+        const { listed, checked } = await this.typecheck(tsc, tsconfig, full);
         let failure: ApplyResult, final = false;
-        if (!included) {
+        if (!checked) {
           failure = outcome('error', `target_not_in_typecheck: tsc --listFilesOnly -p ${this.tsconfig} does not include ${candidate.path}; a typecheck without the target is not validation.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed)));
-        } else {
-          const checked = await this.run(process.execPath, [tsc, ...TYPECHECK_FLAGS, '-p', tsconfig]);
-          if (checked.code === 0) {
-            const changed = await this.changedPaths() ?? [];
-            const foreign = changed.filter(path => !samePath(path, candidate.path));
-            if (foreign.length || !changed.length) {
-              journal('error');
-              return { status: 'error', diagnostics: [`unexpected_changes: validation passed but the worktree has changes besides the target; nothing was reverted: ${foreign.join(', ') || 'Git status unavailable'}`], changedFiles: changed };
-            }
-            candidate.applyResult = { status: 'validated', diagnostics: [], changedFiles: [candidate.path] };
-            journal('validated');
-            return candidate.applyResult;
+        } else if (checked.code === 0) {
+          const changed = await this.changedPaths() ?? [];
+          const foreign = changed.filter(path => !samePath(path, candidate.path));
+          if (foreign.length || !changed.length) {
+            journal('error');
+            return { status: 'error', diagnostics: [`unexpected_changes: validation passed but the worktree has changes besides the target; nothing was reverted: ${foreign.join(', ') || 'Git status unavailable'}`], changedFiles: changed };
           }
+          const head = await this.run('git', ['rev-parse', '--verify', 'HEAD']);
+          if (head.code !== 0) {
+            failure = outcome('error', 'head_unavailable: the repository needs an initial commit to commit the candidate on.', ...commandDiagnostics(head));
+          } else {
+            journal('committing', head.stdout.trim());
+            const added = await this.run('git', ['--literal-pathspecs', 'add', '--', candidate.path]);
+            const commit = added.code !== 0 ? added
+              : await this.run('git', ['commit', '-m', `test: ${base === null ? 'add' : 'update'} ${candidate.path}`, '-m', `${CANDIDATE_TRAILER}: ${candidateId}`]);
+            if (commit.code === 0) {
+              // Every post-commit outcome is final: the commit stays in history and a retry must not commit again.
+              candidate.applyResult = await this.committedResult(candidate, head.stdout.trim(), tsc, tsconfig, full);
+              journal(candidate.applyResult.status === 'committed' ? 'committed' : 'error');
+              return candidate.applyResult;
+            }
+            const unstaged = await this.run('git', ['--literal-pathspecs', 'restore', '--staged', '--', candidate.path]);
+            failure = outcome('error', 'commit_failed: Git or a hook refused the commit; the target was unstaged and the candidate can be applied again.', ...commandDiagnostics(commit),
+              ...(unstaged.code === 0 ? [] : [`unstage_failed: ${candidate.path} may still be staged.`, ...commandDiagnostics(unstaged)]));
+          }
+        } else {
           // Only a real tsc exit code judges the candidate; a timeout, kill or spawn failure must not burn an approved candidate.
           final = typeof checked.code === 'number';
           failure = final ? outcome('validation_failed', ...commandDiagnostics(checked))
@@ -289,7 +345,8 @@ export class SessionStore {
         journal(!restored ? 'conflict' : failure.status === 'error' ? 'error' : 'restored');
         return failure;
       } catch (error: unknown) {
-        journal(this.restore(candidate) === 'restored' ? 'error' : 'conflict');
+        const phase = state.apply?.phase === 'committing' ? this.recoverCommit(candidate, state.apply.head ?? '') : this.restore(candidate);
+        journal(phase === 'restored' ? 'error' : phase);
         throw error;
       }
     } finally { this.applyRunning = false; }

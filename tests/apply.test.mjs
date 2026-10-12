@@ -26,9 +26,14 @@ async function fixture(t, { base = null, git = true } = {}) {
   writeFileSync(join(root, '.gitignore'), 'node_modules/\n');
   if (base !== null) writeFileSync(join(root, 'value.test.ts'), base);
   const run = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' });
+  const hooks = join(temp, 'no-hooks');
+  // Git for Windows runs hooks through its bundled sh by the shebang; the mode makes them executable elsewhere.
+  const hook = (body) => { mkdirSync(hooks, { recursive: true }); writeFileSync(join(hooks, 'pre-commit'), `#!/bin/sh\n${body}\n`, { mode: 0o755 }); };
+  const unhook = () => rmSync(join(hooks, 'pre-commit'));
+  const head = () => run('rev-parse', 'HEAD').trim();
   if (git) {
     run('init', '-q');
-    for (const [key, value] of [['user.name', 'Test'], ['user.email', 'test@example.invalid'], ['commit.gpgsign', 'false'], ['core.autocrlf', 'false'], ['core.hooksPath', join(temp, 'no-hooks')]]) run('config', key, value);
+    for (const [key, value] of [['user.name', 'Test'], ['user.email', 'test@example.invalid'], ['commit.gpgsign', 'false'], ['core.autocrlf', 'false'], ['core.hooksPath', hooks]]) run('config', key, value);
     run('add', '.'); run('commit', '-q', '-m', 'initial');
   }
   const replies = [];
@@ -56,29 +61,121 @@ async function fixture(t, { base = null, git = true } = {}) {
     store.contextSet(id, { files: ['source.ts'], brief: 'Test the value', acceptanceCriteria: [] });
     return id;
   }
-  return { temp, root, config, target, run, dirty, open, candidate, session };
+  // The commit under test must be HEAD and a direct child of the pre-apply HEAD.
+  const committed = (before) => {
+    assert.equal(run('rev-parse', 'HEAD^').trim(), before);
+    return { files: run('diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD').trim().split('\n'), blob: run('show', 'HEAD:value.test.ts'), message: run('log', '-1', '--format=%B') };
+  };
+  const journal = (id, apply) => {
+    const db = new DatabaseSync(join(root, '.stateful-worker', 'state.sqlite'));
+    const state = JSON.parse(db.prepare('SELECT state FROM sessions WHERE id = ?').get(id).state);
+    db.prepare('UPDATE sessions SET state = ? WHERE id = ?').run(JSON.stringify({ ...state, apply }), id);
+    db.close();
+  };
+  return { temp, root, config, target, run, dirty, open, candidate, session, hook, unhook, head, committed, journal };
 }
 
-test('approved compilable candidate is validated, only the target changes, and a repeat does not rerun tsc', async (t) => {
+test('approved compilable candidate is committed alone with a trailer, and a repeat neither reruns tsc nor commits', async (t) => {
   const f = await fixture(t);
-  const store = f.open(), id = await f.session(store), c = await f.candidate(store, id, PASSING);
+  const store = f.open(), id = await f.session(store), c = await f.candidate(store, id, PASSING), before = f.head();
   const result = await store.candidateApply(id, c);
-  assert.deepEqual(result, { status: 'validated', diagnostics: [], changedFiles: ['value.test.ts'] });
-  assert.equal(readFileSync(f.target, 'utf8'), PASSING);
-  assert.deepEqual(f.dirty(), ['?? value.test.ts']);
-  assert.equal(store.status(id).phase, 'validated');
+  assert.deepEqual(result, { status: 'committed', diagnostics: [], changedFiles: ['value.test.ts'] });
+  const commit = f.committed(before);
+  assert.deepEqual(commit.files, ['value.test.ts']);
+  assert.equal(commit.blob, PASSING);
+  assert.equal(commit.message.trim(), `test: add value.test.ts\n\nStateful-Worker-Candidate: ${c}`);
+  assert.deepEqual(f.dirty(), []);
+  assert.equal(store.status(id).phase, 'committed');
+  const after = f.head();
   // A rerun of tsc would fail without its config, so an unchanged result proves the stored result was reused.
   renameSync(join(f.root, 'tsconfig.json'), join(f.root, 'moved.json'));
   assert.deepEqual(await store.candidateApply(id, c), result);
+  assert.equal(f.head(), after);
   assert.equal(readFileSync(f.target, 'utf8'), PASSING);
+});
+
+test('hooks that reformat the target commit with a diff, but a hook that breaks the typecheck keeps the commit as an error', async (t) => {
+  for (const [line, status] of [['// formatted by hook', 'committed'], ['const broken: string = 1;', 'error']]) {
+    const f = await fixture(t, { base: BASE });
+    f.hook(`printf '%s\\n' '${line}' >> value.test.ts && git add value.test.ts`);
+    const store = f.open(), id = await f.session(store), c = await f.candidate(store, id, PASSING), before = f.head();
+    const result = await store.candidateApply(id, c);
+    assert.equal(result.status, status, result.diagnostics.join('\n'));
+    const commit = f.committed(before);
+    assert.equal(commit.blob, `${PASSING}${line}\n`);
+    assert.match(commit.message, /^test: update value\.test\.ts/);
+    assert.deepEqual(f.dirty(), []);
+    if (status === 'committed') {
+      assert.equal(result.hooksModified, true);
+      assert.ok(result.diagnostics.some(text => text.includes(`+${line}`) && text.includes('--- a/value.test.ts')), result.diagnostics.join('\n'));
+    } else {
+      assert.match(result.diagnostics.join('\n'), /hooks_broke_typecheck[\s\S]*TS2322/);
+    }
+    assert.equal(store.status(id).details.candidates[0].applyResult.status, status);
+    assert.deepEqual(await store.candidateApply(id, c), result);
+    assert.equal(f.run('rev-list', '--count', 'HEAD').trim(), '2');
+  }
+});
+
+test('a rejecting hook leaves HEAD, index and target as before, and the same candidate commits once the hook is gone', async (t) => {
+  const f = await fixture(t);
+  f.hook('echo rejected by hook >&2; exit 1');
+  const store = f.open(), id = await f.session(store), c = await f.candidate(store, id, PASSING), before = f.head();
+  const result = await store.candidateApply(id, c);
+  assert.equal(result.status, 'error');
+  assert.match(result.diagnostics.join('\n'), /commit_failed[\s\S]*rejected by hook/);
+  assert.equal(f.head(), before);
+  assert.equal(existsSync(f.target), false);
+  assert.deepEqual(f.dirty(), []);
+  f.unhook();
+  assert.equal((await store.candidateApply(id, c)).status, 'committed');
+  assert.deepEqual(f.committed(before).files, ['value.test.ts']);
+});
+
+test('a hook that stages another file is a scope violation and the commit stays', async (t) => {
+  const f = await fixture(t);
+  f.hook('echo extra > extra.txt && git add extra.txt');
+  const store = f.open(), id = await f.session(store), c = await f.candidate(store, id, PASSING), before = f.head();
+  const result = await store.candidateApply(id, c);
+  assert.equal(result.status, 'error');
+  assert.match(result.diagnostics.join('\n'), /commit_scope_violation.*extra\.txt/);
+  assert.deepEqual(f.committed(before).files.sort(), ['extra.txt', 'value.test.ts']);
+  assert.deepEqual(await store.candidateApply(id, c), result);
+});
+
+test('crash while committing keeps an existing trailer commit, or unstages and restores when no commit was made', async (t) => {
+  for (const made of [true, false]) {
+    const f = await fixture(t);
+    let store = f.open();
+    const id = await f.session(store), c = await f.candidate(store, id, PASSING), before = f.head();
+    store.close();
+    writeFileSync(f.target, PASSING);
+    f.run('add', '--', 'value.test.ts');
+    if (made) f.run('commit', '-q', '-m', 'test: add value.test.ts', '-m', `Stateful-Worker-Candidate: ${c}`);
+    const after = f.head();
+    f.journal(id, { candidateId: c, phase: 'committing', head: before });
+    store = f.open();
+    const status = store.status(id);
+    assert.equal(status.phase, made ? 'committed' : 'restored');
+    assert.equal(status.details.errors.at(-1).code, 'apply_interrupted');
+    assert.equal(f.head(), after);
+    assert.deepEqual(f.dirty(), []);
+    assert.equal(existsSync(f.target), made);
+    if (made) {
+      assert.match(status.details.candidates[0].applyResult.diagnostics.join('\n'), /recovered_after_crash/);
+      assert.equal((await store.candidateApply(id, c)).status, 'committed');
+      assert.equal(f.head(), after);
+    }
+  }
 });
 
 test('non-compiling candidate returns tsc diagnostics and restores the base byte-for-byte or removes a new file', async (t) => {
   for (const base of [BASE, null]) {
     const f = await fixture(t, { base });
-    const store = f.open(), id = await f.session(store), c = await f.candidate(store, id, FAILING);
+    const store = f.open(), id = await f.session(store), c = await f.candidate(store, id, FAILING), before = f.head();
     const result = await store.candidateApply(id, c);
     assert.equal(result.status, 'validation_failed');
+    assert.equal(f.head(), before);
     assert.deepEqual(result.changedFiles, []);
     assert.ok(result.diagnostics.some(line => line.includes('TS2322')), result.diagnostics.join('\n'));
     assert.ok(result.diagnostics.some(line => /exit code: 2|exit code: 1/.test(line)));
@@ -90,7 +187,7 @@ test('non-compiling candidate returns tsc diagnostics and restores the base byte
     const fixed = await f.candidate(store, id, PASSING, null);
     await assert.rejects(store.candidateApply(id, fixed), /approved/i);
     store.candidateReview(id, fixed, 'approve', []);
-    assert.equal((await store.candidateApply(id, fixed)).status, 'validated');
+    assert.equal((await store.candidateApply(id, fixed)).status, 'committed');
   }
 });
 
@@ -163,7 +260,12 @@ test('a running apply blocks chat, context and review in its session and any sec
   assert.throws(() => store.candidateReview(id, c, 'reject', []), /busy/i);
   await assert.rejects(store.workerChat(id, 'Late request'), /busy/i);
   await assert.rejects(store.candidateApply(other, otherC), { code: 'apply_busy' });
-  assert.equal((await running).status, 'validated');
+  f.hook('sleep 1'); // keeps the commit running long enough to observe the committing phase
+  while (store.status(id).phase !== 'committing') await new Promise(resolve => setImmediate(resolve));
+  assert.equal(store.status(id).pendingAction, 'wait_for_apply');
+  assert.throws(() => store.candidateReview(id, c, 'reject', []), /busy/i);
+  await assert.rejects(store.candidateApply(other, otherC), { code: 'apply_busy' });
+  assert.equal((await running).status, 'committed');
 });
 
 test('crash after the write restores the base on restart, but externally changed targets stay untouched as conflict', async (t) => {
