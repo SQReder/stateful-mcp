@@ -51,6 +51,7 @@
 - [x] Require the agreed scenario list in `context_set` `acceptanceCriteria`; the worker prompt asks to implement exactly that list; the role sends it before generation.
 - [x] Return a new candidate's code from `worker_chat` (`artifact`) instead of the raw JSON reply; `candidate_read` stays for diffs, history and restarts.
 - [x] Input budget 64K tokens of the 96K window, estimated as UTF-8 bytes / 3 + 256; files and candidates up to 192000 bytes.
+- [ ] Run `npm run smoke:e2e` on `gpt-6-luna` (new contract, apply and raw commit with a real model). Not passed yet: on 2026-10-13 every one of 8 attempts over ~35 minutes got `HTTP 429` at the first `worker_chat`; MCP, TLS, `session_start` and `context_set` worked.
 
 ## Deployment/pilot checks
 
