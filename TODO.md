@@ -26,6 +26,16 @@
 - [ ] Known minor gaps from the review, deferred: `session_status` details show raw `approved` for stale candidates (`candidate_read` reports `stale`); when the last reply produced no candidate, the prompt omits that reply while a candidate exists.
 - [ ] Run the review loop from corporate Kilo with Qwen3.6 reviewing real code and diff, without copying between chats (developer with corporate Kilo).
 
+## I3 — safe apply and validation loop (local mechanics)
+
+- [x] Add `candidate_apply` with approval, revision, clean Git, context and base checks before any write.
+- [x] Typecheck with the workspace `tsc` and trusted `WORKER_TSCONFIG`; require the target in `--listFilesOnly`; validation writes no files.
+- [x] Restore only an unmodified target after failure; report `conflict` otherwise; journal phases and recover after a crash without replay.
+- [x] Complete the independent I3 review; reject artifacts over 32000 bytes, keep candidates reusable after a tsc timeout, strip the key from child env under any spelling.
+- [x] Verify locally (`npm test`: 37 passed, real `tsc` 7.0.2 in disposable Git repos).
+- [ ] Run apply/validation from corporate Kilo on a real pilot module with its own test tsconfig (developer with corporate Kilo).
+- [ ] Known limits: compare-then-write restore race; `typescript` may resolve from a hoisted `node_modules` outside the workspace; untested timeout branch (needs a configurable timeout or fake compiler).
+
 ## Deployment/pilot checks
 
 - [ ] Verify target Qwen3-Next access, tokenizer/window and quality in the corporate environment; does not block local I1 by user decision.
