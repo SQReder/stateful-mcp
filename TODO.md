@@ -59,6 +59,11 @@
 - [x] Choose postprocess tools from package.json (package or parents); skip undeclared ones, any ESLint 8/9 or Prettier version (`npm test`: 53 passed).
 - [ ] Re-run the monorepo pilot in corporate Kilo with real ESLint 8/9 and Prettier configs per package (developer with corporate Kilo).
 
+## Uncommitted work alongside apply (user decision, 2026-10-13)
+
+- [x] Require only an untouched target and an empty index; report uncommitted files in the tsc program (`validated_with_uncommitted`), never burn a candidate when they may cause target errors, re-check the index right before committing (`npm test`: 57 passed; independent review findings fixed).
+- [ ] Known limit: a hook that stages other files (e.g. `git add .`) or rewrites an already-dirty file is seen only after the commit (`commit_scope_violation`) or not at all; preventing it would need bypassing hooks.
+
 ## Deployment/pilot checks
 
 - [ ] Verify target Qwen3-Next access, tokenizer/window and quality in the corporate environment; does not block local I1 by user decision.
