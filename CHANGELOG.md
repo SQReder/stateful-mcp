@@ -20,4 +20,5 @@
 - Add fake-backend contract tests, MCP transport checks and an opt-in live smoke command.
 
 ### Changed
+- Derive the workspace root at startup from the Git repository of the MCP process's working directory instead of `WORKER_WORKSPACE_ROOT`; `worker_diagnostics` reports it.
 - Preserve Git hooks in the planned raw-commit workflow; defer modifying-hook compatibility to I4.

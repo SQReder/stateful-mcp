@@ -17,6 +17,12 @@
    ключом только в этих настройках. Не записывай его в файлы проекта или `.kilocodemodes`.
 4. Вызови `worker_diagnostics` с `{}`. При правильной конфигурации получишь
    `configured: true`; это ещё не доказательство доступности модели.
+   Проверь `workspaceRoot`: это корень Git-репозитория, в котором Kilo
+   запустил сервер, и именно с ним будут работать session tools. Если вместо
+   него пришёл `workspaceError` или там не твой проект, Kilo запускает сервер
+   не из каталога проекта. Тогда задай рабочий каталог процесса в настройках
+   MCP. В апстримных конфигурациях это поле `cwd`; поддерживает ли его твоя
+   сборка Kilo, не проверено.
 5. Вызови `worker_instruct` с `{"message":"Reply with the single word READY."}`.
    Успех — `ok: true`, непустой `text`, `finishReason: "stop"`.
 6. Проверь загрузку `.kilocodemodes`, видимость роли `qwen-test-supervisor`
@@ -38,7 +44,6 @@
       "env": {
         "WORKER_BASE_URL": "https://localhost:8317/v1",
         "WORKER_MODEL": "gpt-6-luna",
-        "WORKER_WORKSPACE_ROOT": "S:/stateful-mcp",
         "WORKER_TSCONFIG": "tsconfig.json",
         "WORKER_POSTPROCESS": "prettier,eslint",
         "HARNESS_MODEL_API_KEY": "<API_KEY>"
@@ -71,9 +76,10 @@ HTTP 401/403 означает отказ авторизации/доступа, 
 остаются отдельными deployment/пилотными проверками.
 
 Для I1 вызови `session_start` → `context_set` → `worker_chat` → `session_status`.
-Путь `WORKER_WORKSPACE_ROOT` доверенный и абсолютный; session tools не принимают
-его от модели. SQLite по умолчанию создаётся в `.stateful-worker/state.sqlite`
-под этим корнем и содержит полные исходники и историю. Путь хранилища фиксирован;
+Корень проекта MCP вычисляет сам при запуске из своего рабочего каталога;
+ни настройки, ни аргументы tools его не задают. SQLite создаётся в
+`.stateful-worker/state.sqlite` под этим корнем и содержит полные исходники и
+историю. Путь хранилища фиксирован;
 symlink-пути запрещены, одна DB — один процесс.
 Для чтения сохранённых данных после рестарта используй `session_status` с
 `includeDetails: true`; обычный status не возвращает весь контекст.
@@ -107,7 +113,7 @@ symlink-пути запрещены, одна DB — один процесс.
 
 ## Проверка apply, компиляции, raw commit и postprocess (I3–I4)
 
-`WORKER_TSCONFIG` — путь относительно `WORKER_WORKSPACE_ROOT` к tsconfig,
+`WORKER_TSCONFIG` — путь относительно корня проекта к tsconfig,
 в который попадают тестовые файлы. Если основной `tsconfig.json` исключает
 `*.test.ts`, укажи отдельный конфиг для проверки тестов. Корень проекта
 должен быть корнем Git-репозитория хотя бы с одним коммитом, а `typescript`

@@ -57,6 +57,7 @@
 
 - [ ] Verify target Qwen3-Next access, tokenizer/window and quality in the corporate environment; does not block local I1 by user decision.
 - [ ] Verify role loading and actual permissions in corporate Kilo (developer with corporate Kilo).
+- [ ] Confirm corporate Kilo starts the MCP inside the project: `worker_diagnostics.workspaceRoot` must be the project's Git root; otherwise find its working-directory setting (developer with corporate Kilo).
 
 ## Later gates
 

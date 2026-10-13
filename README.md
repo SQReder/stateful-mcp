@@ -26,11 +26,16 @@ npm test
 | `WORKER_MODEL` | Реальный идентификатор модели на этом endpoint |
 | `HARNESS_MODEL_API_KEY` | Существующий ключ, передаваемый как Bearer |
 | `WORKER_TIMEOUT_MS` | Таймаут подключения и чтения ответа; по умолчанию 60000 |
-| `WORKER_WORKSPACE_ROOT` | Обязательный абсолютный корень проекта для session tools |
 | `WORKER_TSCONFIG` | Путь к tsconfig для проверки кандидата относительно корня проекта; нужен `candidate_apply` и `postprocess` |
 | `WORKER_POSTPROCESS` | Инструменты `postprocess` в порядке запуска через запятую: `prettier`, `eslint` |
 
-`worker_diagnostics({})` проверяет конфигурацию без inference.
+Корень проекта не настраивается: при запуске MCP берёт Git-репозиторий своего
+рабочего каталога (`git rev-parse --show-toplevel`). Session tools работают
+только внутри Git-репозитория; иначе они возвращают `configuration_error`, а
+хранилище нигде не создаётся.
+
+`worker_diagnostics({})` проверяет конфигурацию без inference и показывает
+вычисленный `workspaceRoot` (или `workspaceError`).
 `worker_instruct({ message })` делает ровно один запрос без tools и retries,
 возвращает полный текст либо безопасную диагностику. Неполный ответ и попытка
 tool call считаются ошибкой. Этот вызов не хранит диалог.
