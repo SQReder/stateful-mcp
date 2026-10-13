@@ -22,12 +22,13 @@ git('add', '.'); git('commit', '-q', '-m', 'initial');
 
 const client = new Client({ name: 'live-e2e', version: '1.0.0' });
 const transport = new StdioClientTransport({
-  command: process.execPath, args: ['--use-system-ca', 'dist/server.js'], cwd: process.cwd(), stderr: 'pipe',
+  // Started inside the project, as Kilo would: the server derives its workspace from this cwd.
+  command: process.execPath, args: ['--use-system-ca', resolve('dist/server.js')], cwd: root, stderr: 'pipe',
   env: {
     WORKER_BASE_URL: process.env.WORKER_BASE_URL ?? '',
     WORKER_MODEL: process.env.WORKER_MODEL ?? '',
     HARNESS_MODEL_API_KEY: process.env.HARNESS_MODEL_API_KEY ?? '',
-    WORKER_WORKSPACE_ROOT: root, WORKER_TSCONFIG: 'tsconfig.json',
+    WORKER_TSCONFIG: 'tsconfig.json',
     ...(process.env.WORKER_TIMEOUT_MS ? { WORKER_TIMEOUT_MS: process.env.WORKER_TIMEOUT_MS } : {}),
     ...(process.env.NODE_EXTRA_CA_CERTS ? { NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS } : {}),
   },

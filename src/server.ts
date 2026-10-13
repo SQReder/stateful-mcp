@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { execFileSync } from 'node:child_process';
 import { z } from 'zod';
 import { SessionError, SessionStore } from './sessions.js';
 import { chat, ConfigurationError, readConfig } from './worker.js';
@@ -8,6 +9,16 @@ import { chat, ConfigurationError, readConfig } from './worker.js';
 const server = new McpServer({ name: 'stateful-coding-worker', version: '0.1.0' });
 let sessions: SessionStore | undefined;
 process.once('exit', () => sessions?.close());
+
+// The project is the Git repository the MCP process starts in, computed once at launch; it is never configured or a tool argument.
+// Outside a repository there is no safe place for the store, so session tools refuse instead of guessing.
+const workspace: { root: string } | { error: string } = (() => {
+  try {
+    return { root: execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim() };
+  } catch {
+    return { error: `Start the MCP server inside the project's Git repository; ${process.cwd()} is not in one.` };
+  }
+})();
 
 function result(value: Record<string, unknown>, isError = false): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value, isError };
@@ -20,7 +31,8 @@ server.registerTool('worker_diagnostics', {
 }, () => {
   try {
     const config = readConfig();
-    return result({ configured: true, model: config.model, timeoutMs: config.timeoutMs, stage: 'I3' });
+    return result({ configured: true, model: config.model, timeoutMs: config.timeoutMs, stage: 'I4',
+      ...('root' in workspace ? { workspaceRoot: workspace.root } : { workspaceError: workspace.error }) });
   } catch (error: unknown) {
     if (!(error instanceof ConfigurationError)) throw error;
     return result({ configured: false, error: { code: 'configuration_error', message: error.message } }, true);
@@ -44,9 +56,8 @@ server.registerTool('worker_instruct', {
 async function sessionResult(operation: (store: SessionStore) => Record<string, unknown> | Promise<Record<string, unknown>>): Promise<CallToolResult> {
   try {
     if (!sessions) {
-      const root = process.env.WORKER_WORKSPACE_ROOT;
-      if (!root) throw new ConfigurationError('Missing WORKER_WORKSPACE_ROOT.');
-      sessions = new SessionStore(root, readConfig(), process.env.WORKER_TSCONFIG, process.env.WORKER_POSTPROCESS);
+      if ('error' in workspace) throw new ConfigurationError(workspace.error);
+      sessions = new SessionStore(workspace.root, readConfig(), process.env.WORKER_TSCONFIG, process.env.WORKER_POSTPROCESS);
     }
     return result(await operation(sessions));
   } catch (error: unknown) {
