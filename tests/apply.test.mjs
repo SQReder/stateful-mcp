@@ -187,6 +187,37 @@ test('tsc errors only outside the target, e.g. in unfinished work, do not burn t
   assert.equal((await store.candidateApply(id, c)).status, 'committed');
 });
 
+test('uncommitted files in the typechecked program are reported on success and never burn the candidate on failure', async (t) => {
+  for (const [wip, status, code] of [
+    ['export const value = 1;\nexport const extra = 2;\n', 'committed', /validated_with_uncommitted.*source\.ts/],
+    ["export const value = 'one';\n", 'error', /typecheck_failed_with_uncommitted.*source\.ts/],
+  ]) {
+    const f = await fixture(t, { base: BASE });
+    writeFileSync(join(f.root, 'source.ts'), wip); // unfinished work in the module under test, snapshotted by context_set
+    const store = f.open(), id = await f.session(store), c = await f.candidate(store, id, PASSING);
+    const result = await store.candidateApply(id, c);
+    assert.equal(result.status, status, result.diagnostics.join('\n'));
+    assert.match(result.diagnostics.join('\n'), code);
+    assert.equal(readFileSync(join(f.root, 'source.ts'), 'utf8'), wip);
+    if (status === 'error') assert.equal(store.status(id).details.candidates[0].applyResult, undefined);
+  }
+});
+
+test('a file staged while tsc runs keeps the commit from happening instead of joining it', async (t) => {
+  const f = await fixture(t, { base: BASE });
+  writeFileSync(join(f.root, 'notes.txt'), 'unrelated work');
+  const store = f.open(), id = await f.session(store), c = await f.candidate(store, id, PASSING), before = f.head();
+  const running = store.candidateApply(id, c);
+  while (store.status(id).phase !== 'validating') await new Promise(resolve => setImmediate(resolve));
+  f.run('add', 'notes.txt'); // tsc runs for far longer than this
+  const result = await running;
+  assert.equal(result.status, 'conflict');
+  assert.match(result.diagnostics.join('\n'), /index_not_clean.*notes\.txt/);
+  assert.equal(f.head(), before);
+  assert.equal(readFileSync(f.target, 'utf8'), BASE);
+  assert.deepEqual(f.dirty(), ['A  notes.txt']);
+});
+
 test('external target and context edits are conflicts without writes', async (t) => {
   const f = await fixture(t, { base: BASE });
   const store = f.open(), id = await f.session(store);

@@ -2,7 +2,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, openSync, fstatSync, readSync, closeSync, unlinkSync, writeFileSync, type BigIntStats } from 'node:fs';
 import { createRequire } from 'node:module';
-import { basename, dirname, isAbsolute, join, relative, parse } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, parse, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { chat, type WorkerConfig } from './worker.js';
 import { z } from 'zod';
@@ -359,10 +359,19 @@ export class SessionStore {
    * so the developer's staged work would end up in the commit. Unstaged and untracked work may stay.
    */
   private async stagedConflict(): Promise<Result<'conflict' | 'error'> | undefined> {
-    const staged = await this.run('git', ['diff', '--cached', '--name-only', '-z']);
-    if (staged.code !== 0) return outcome('error', 'git_unavailable: could not read the Git index.', ...commandDiagnostics(staged));
-    const paths = staged.stdout.split('\0').filter(path => path && path !== STORE_DIR && !path.startsWith(`${STORE_DIR}/`));
+    const paths = await this.staged();
+    if (!paths) return outcome('error', 'git_unavailable: could not read the Git index.');
     return paths.length ? outcome('conflict', `index_not_clean: unstage or commit staged changes first; the commit would include them: ${paths.join(', ')}`) : undefined;
+  }
+  /** Staged paths outside the store directory, or null when the index cannot be read. */
+  private async staged(): Promise<string[] | null> {
+    const staged = await this.run('git', ['diff', '--cached', '--name-only', '-z']);
+    return staged.code === 0 ? staged.stdout.split('\0').filter(path => path && path !== STORE_DIR && !path.startsWith(`${STORE_DIR}/`)) : null;
+  }
+  /** Uncommitted paths (from `baseline`) inside the typechecked program, besides `own`: the check saw them, the commit will not include them. */
+  private dirtyInProgram(listed: CommandResult, baseline: string[], own: string[]): string[] {
+    const program = listed.stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean).map(line => resolve(line));
+    return baseline.filter(path => !own.some(mine => samePath(mine, path)) && program.some(file => samePath(file, resolve(this.root, path))));
   }
   /** Changed paths outside the store directory, or null when the workspace is not the root of a usable Git repository. */
   private async changedPaths(): Promise<string[] | null> {
@@ -409,6 +418,9 @@ export class SessionStore {
         writeFileSync(full, candidate.content, { flag: base === null ? 'wx' : 'w' });
         journal('validating');
         const { listed, checked } = await this.typecheck(tsc, tsconfig, full);
+        // The check sees the developer's uncommitted files, the commit does not: say so on success, and never burn the candidate on failure.
+        const uncommitted = this.dirtyInProgram(listed, baseline, [candidate.path]);
+        const uncommittedNote = uncommitted.length ? [`validated_with_uncommitted: the typecheck included uncommitted files, so the raw commit may not compile without them: ${uncommitted.join(', ')}`] : [];
         let failure: ApplyResult, final = false;
         if (!checked) {
           failure = outcome('error', `target_not_in_typecheck: tsc --listFilesOnly -p ${config.path} does not include ${candidate.path}; a typecheck without the target is not validation. Apply again with the tsconfig of the target's package.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed)));
@@ -428,32 +440,38 @@ export class SessionStore {
             candidate.tsconfig = config.path; // saved with the journal, so a commit recovered after a crash keeps it too
             journal('committing', committingHead);
             const added = await this.run('git', ['--literal-pathspecs', 'add', '--', candidate.path]);
-            const commit = added.code !== 0 ? added
+            // Anything staged while tsc ran would ride along in the commit, so the index is checked again right before it.
+            const sneaked = added.code === 0 ? (await this.staged() ?? ['(Git index unreadable)']).filter(path => !samePath(path, candidate.path)) : [];
+            const commit = added.code !== 0 ? added : sneaked.length ? undefined
               // A plain commit of the index, which holds only the target (checked above). A pathspec commit would run hooks on a
               // temporary index, so changes re-staged by hooks such as lint-staged would miss the real index.
               : await this.run('git', ['commit', '-m', `test: ${base === null ? 'add' : 'update'} ${candidate.path}`, '-m', `${CANDIDATE_TRAILER}: ${candidateId}`]);
             // A killed or timed-out git (e.g. a slow post-commit hook) may still have created the commit: HEAD decides, not the exit code.
             // Captured at once: later checks and postprocess must judge this commit even if the developer commits meanwhile.
-            const created = added.code === 0 ? (await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() : committingHead;
-            const moved = commit.code !== 0 && created !== committingHead;
-            if (commit.code === 0 || moved) {
+            const created = commit && added.code === 0 ? (await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() : committingHead;
+            const moved = commit !== undefined && commit.code !== 0 && created !== committingHead;
+            if (commit && (commit.code === 0 || moved)) {
               // Every post-commit outcome is final: the commit stays in history and a retry must not commit again.
               const judged = await this.committedResult(committingHead, created, [candidate], baseline, tsc, tsconfig, full);
               if (judged.status === 'committed') candidate.rawCommit = created;
-              candidate.applyResult = moved ? { ...judged, diagnostics: ['commit_exit_nonzero: git reported a failure after creating the commit; the commit was kept.', ...commandDiagnostics(commit), ...judged.diagnostics] } : judged;
+              const prefix = moved ? ['commit_exit_nonzero: git reported a failure after creating the commit; the commit was kept.', ...commandDiagnostics(commit)] : [];
+              candidate.applyResult = { ...judged, diagnostics: [...prefix, ...judged.diagnostics, ...uncommittedNote] };
               journal(candidate.applyResult.status === 'committed' ? 'committed' : 'error');
               return candidate.applyResult;
             }
             const unstaged = await this.run('git', this.unstageArgs(candidate));
-            failure = outcome('error', 'commit_failed: Git or a hook refused the commit; the target was unstaged and the candidate can be applied again.', ...commandDiagnostics(commit),
-              ...(unstaged.code === 0 ? [] : [`unstage_failed: ${candidate.path} may still be staged.`, ...commandDiagnostics(unstaged)]));
+            const unstageNotes = unstaged.code === 0 ? [] : [`unstage_failed: ${candidate.path} may still be staged.`, ...commandDiagnostics(unstaged)];
+            failure = commit ? outcome('error', 'commit_failed: Git or a hook refused the commit; the target was unstaged and the candidate can be applied again.', ...commandDiagnostics(commit), ...unstageNotes)
+              : outcome('conflict', `index_not_clean: ${sneaked.join(', ')} was staged during the apply and would have joined the commit; it stays staged, the target was unstaged, and the candidate can be applied again.`, ...unstageNotes);
           }
         } else {
           // Only real tsc errors in the target judge the candidate. A timeout, kill or errors only in other (maybe unfinished) files
           // must not burn an approved candidate.
-          const completed = typeof checked.code === 'number';
-          final = completed && reportsErrorIn(checked, [candidate.path]);
+          const completed = typeof checked.code === 'number', inTarget = completed && reportsErrorIn(checked, [candidate.path]);
+          // Errors in the target are the candidate's fault only when no uncommitted file in the program could cause them.
+          final = inTarget && !uncommitted.length;
           failure = final ? outcome('validation_failed', ...commandDiagnostics(checked))
+            : inTarget ? outcome('error', `typecheck_failed_with_uncommitted: tsc reports errors in the target while the program includes uncommitted files that may cause them (${uncommitted.join(', ')}); finish or commit that work, then apply the same candidate again.`, ...commandDiagnostics(checked))
             : completed ? outcome('error', 'typecheck_failed_elsewhere: tsc reports errors only outside the target, e.g. in uncommitted work; fix them and apply the same candidate again.', ...commandDiagnostics(checked))
             : outcome('error', 'typecheck_not_completed: tsc did not finish; the candidate can be applied again.', ...commandDiagnostics(checked));
         }
@@ -606,28 +624,35 @@ export class SessionStore {
         let completed = false;
         if (!failure) {
           const full = this.safePath(candidate.path, false), { listed, checked } = await this.typecheck(tsc, tsconfig, full);
+          const uncommitted = this.dirtyInProgram(listed, baseline, touched); // as in candidateApply
           if (checked?.code === 0) {
             journal('postprocess_committing', formatted);
             const added = await this.run('git', ['--literal-pathspecs', 'add', '--', ...touched]);
-            const commit = added.code !== 0 ? added
+            // As in candidateApply: anything staged while tsc ran would ride along, so the index is checked again right before the commit.
+            const sneaked = added.code === 0 ? (await this.staged() ?? ['(Git index unreadable)']).filter(path => !touched.some(own => samePath(own, path))) : [];
+            const commit = added.code !== 0 ? added : sneaked.length ? undefined
               : await this.run('git', ['commit', '-m', `style: format ${candidate.path}`, '-m', `${POSTPROCESS_TRAILER}: ${candidate.id}`]);
             // As in candidateApply: HEAD, not the exit code, decides whether a commit exists.
-            const created = added.code === 0 ? (await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() : raw;
-            const moved = commit.code !== 0 && created !== raw;
-            if (commit.code === 0 || moved) {
+            const created = commit && added.code === 0 ? (await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() : raw;
+            const moved = commit !== undefined && commit.code !== 0 && created !== raw;
+            if (commit && (commit.code === 0 || moved)) {
               const judged = await this.committedResult(raw, created, after, baseline, tsc, tsconfig, full);
               const prefix = moved ? ['commit_exit_nonzero: git reported a failure after creating the commit; the commit was kept.', ...commandDiagnostics(commit)] : [];
-              return final({ ...judged, diagnostics: [...prefix, ...judged.diagnostics, ...notes] }, judged.status === 'committed' ? 'postprocessed' : 'error');
+              const uncommittedNote = uncommitted.length ? [`validated_with_uncommitted: the typecheck included uncommitted files: ${uncommitted.join(', ')}`] : [];
+              return final({ ...judged, diagnostics: [...prefix, ...judged.diagnostics, ...notes, ...uncommittedNote] }, judged.status === 'committed' ? 'postprocessed' : 'error');
             }
             const unstaged = await this.run('git', ['--literal-pathspecs', 'restore', '--staged', '--', ...touched]);
-            failure = ['commit_failed: Git or a hook refused the postprocess commit; the raw commit stays and postprocess can run again.', ...commandDiagnostics(commit),
-              ...(unstaged.code === 0 ? [] : [`unstage_failed: ${touched.join(', ')} may still be staged.`, ...commandDiagnostics(unstaged)])];
+            const unstageNotes = unstaged.code === 0 ? [] : [`unstage_failed: ${touched.join(', ')} may still be staged.`, ...commandDiagnostics(unstaged)];
+            failure = commit ? ['commit_failed: Git or a hook refused the postprocess commit; the raw commit stays and postprocess can run again.', ...commandDiagnostics(commit), ...unstageNotes]
+              : [`index_not_clean: ${sneaked.join(', ')} was staged during postprocess and would have joined the commit; it stays staged and postprocess can run again.`, ...unstageNotes];
           } else if (!checked) {
             failure = [`target_not_in_typecheck: tsc --listFilesOnly -p ${config.path} does not include ${candidate.path}; a typecheck without the target is not validation.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed))];
           } else {
-            // Only real tsc errors in the formatted files judge the formatting; a timeout, kill or errors elsewhere stay retryable.
-            completed = typeof checked.code === 'number' && reportsErrorIn(checked, touched);
+            // Only real tsc errors in the formatted files, with no uncommitted file in the program to blame, judge the formatting.
+            const inTouched = typeof checked.code === 'number' && reportsErrorIn(checked, touched);
+            completed = inTouched && !uncommitted.length;
             failure = [completed ? 'postprocess_broke_typecheck: the formatted files fail the typecheck; nothing was committed and the raw commit stays.'
+              : inTouched ? `typecheck_failed_with_uncommitted: the formatted files fail the typecheck while the program includes uncommitted files that may cause it (${uncommitted.join(', ')}); finish or commit that work and run postprocess again.`
               : typeof checked.code === 'number' ? 'typecheck_failed_elsewhere: tsc reports errors only outside the formatted files, e.g. in uncommitted work; fix them and run postprocess again.'
               : 'typecheck_not_completed: tsc did not finish; postprocess can run again.', ...commandDiagnostics(checked)];
           }
