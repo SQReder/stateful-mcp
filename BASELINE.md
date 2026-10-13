@@ -182,6 +182,7 @@ candidate_review(input: {
 candidate_apply(input: {
   sessionId: SessionId;
   candidateId: CandidateId;
+  tsconfig?: string;       // workspace-relative tsconfig of the target's package; default WORKER_TSCONFIG
 }): {
   status: 'committed' | 'validation_failed' | 'conflict' |
           'error' | 'no_changes';
@@ -189,7 +190,10 @@ candidate_apply(input: {
   changedFiles: string[];
 };
 
-postprocess(input: { sessionId: SessionId }): {
+postprocess(input: {
+  sessionId: SessionId;
+  packageDir?: string;     // where the tools run and resolve; default: directory of the apply tsconfig
+}): {
   status: 'committed' | 'no_changes' | 'failed' | 'conflict';
   changedFiles: string[];
   diagnostics: string[];
@@ -240,7 +244,7 @@ USER: current request from Qwen3.6
 
 ### Общая политика
 
-Минимальный обязательный gate для *программного кода* — **успешная компиляция / typecheck**, включающая реально изменённые файлы. Дополнительные проверки могут быть обязательными для конкретной задачи (например, тесты, линт, сборка), но на MVP не вводим абстрактный исполняемый pipeline от LLM. Validation commands определяются доверенной конфигурацией репозитория/MCP и **не** принимаются произвольной shell-строкой от Qwen3.6.
+Минимальный обязательный gate для *программного кода* — **успешная компиляция / typecheck**, включающая реально изменённые файлы. Дополнительные проверки могут быть обязательными для конкретной задачи (например, тесты, линт, сборка), но на MVP не вводим абстрактный исполняемый pipeline от LLM. Validation commands определяются доверенной конфигурацией репозитория/MCP и **не** принимаются произвольной shell-строкой от Qwen3.6. Решение пользователя 2026-10-13 для монорепозиториев: Qwen3.6 выбирает **путь** к tsconfig пакета (`candidate_apply.tsconfig`) и каталог пакета для инструментов (`postprocess.packageDir`). Это пути к файлам внутри проекта с теми же проверками границ; команды, флаги и набор инструментов остаются фиксированными в MCP, а проверка `--listFilesOnly` по-прежнему доказывает, что целевой тест входит в typecheck.
 
 Кандидат проходит: `review(approve)` → apply only allowed paths → read-only validation → `raw commit` с обязательными hooks → postprocess only paths changed in raw commit → повторная validation → postprocess commit при наличии изменений.
 

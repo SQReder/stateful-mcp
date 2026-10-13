@@ -20,5 +20,6 @@
 - Add fake-backend contract tests, MCP transport checks and an opt-in live smoke command.
 
 ### Changed
+- Let the orchestrator choose the package tsconfig in `candidate_apply` (`tsconfig`, default `WORKER_TSCONFIG`) and the package directory in `postprocess` (`packageDir`, default the tsconfig's directory) for monorepos; `tsc`, prettier and eslint resolve from that package and the tools run there.
 - Derive the workspace root at startup from the Git repository of the MCP process's working directory instead of `WORKER_WORKSPACE_ROOT`; `worker_diagnostics` reports it.
 - Preserve Git hooks in the planned raw-commit workflow; defer modifying-hook compatibility to I4.

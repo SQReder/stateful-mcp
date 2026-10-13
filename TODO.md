@@ -53,6 +53,11 @@
 - [x] Input budget 64K tokens of the 96K window, estimated as UTF-8 bytes / 3 + 256; files and candidates up to 192000 bytes.
 - [x] Run `npm run smoke:e2e` on `gpt-6-luna` (2026-10-13, after earlier `HTTP 429` rate limits): two candidates, scripted reject → approve, `candidate_apply` → `committed` with only `clamp.test.ts` and a clean tree; real `tsc`, TLS verified. The scripted reviewer proves mechanics, not test quality; `postprocess` is not part of this run.
 
+## Monorepo support (user decision, 2026-10-13)
+
+- [x] Let the orchestrator pass the package tsconfig to `candidate_apply` and `packageDir` to `postprocess`; resolve `tsc`, prettier and eslint from the package and run the tools there (`npm test`: 52 passed).
+- [ ] Re-run the monorepo pilot in corporate Kilo with real ESLint/Prettier configs per package (developer with corporate Kilo).
+
 ## Deployment/pilot checks
 
 - [ ] Verify target Qwen3-Next access, tokenizer/window and quality in the corporate environment; does not block local I1 by user decision.

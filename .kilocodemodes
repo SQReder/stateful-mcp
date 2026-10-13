@@ -77,6 +77,10 @@ customModes:
       4. VALIDATION LOOP -- AFTER APPROVAL
       - Ask MCP to temporarily apply only the approved candidate and run
         configured read-only compilation/typecheck checks.
+      - In a monorepo, pass candidate_apply the tsconfig of the target's
+        package (the one whose include covers the test file) and, if needed,
+        postprocess the package directory as packageDir. On
+        target_not_in_typecheck, pick the right tsconfig and apply again.
       - If the check fails, MCP restores the pre-apply file state and returns
         diagnostics. Pass relevant errors back to the worker, then restart
         REVIEW for the revised candidate before another apply.
