@@ -45,7 +45,6 @@
         "WORKER_BASE_URL": "https://localhost:8317/v1",
         "WORKER_MODEL": "gpt-6-luna",
         "WORKER_TSCONFIG": "tsconfig.json",
-        "WORKER_POSTPROCESS": "prettier,eslint",
         "HARNESS_MODEL_API_KEY": "<API_KEY>"
       }
     }
@@ -139,8 +138,12 @@ symlink-пути запрещены, одна DB — один процесс.
    проходит ревью и `candidate_review` перед `candidate_apply`.
 
 5. После `committed` вызови `postprocess` с тем же `sessionId`.
-   `WORKER_POSTPROCESS` перечисляет инструменты проекта в порядке запуска,
-   например `prettier,eslint`; они должны быть установлены в проекте. Успех —
+   Запускаются eslint и prettier, если пакет или его родители объявляют их в
+   `package.json`; версия ESLint (8 или 9) неважна. Пакет без линтера или
+   форматтера не ошибка: в ответе будет `tool_skipped`. Объявленный, но не
+   установленный инструмент — `tool_not_found`: выполни `npm install`.
+   `WORKER_POSTPROCESS` нужен, только чтобы изменить порядок (по умолчанию
+   `eslint,prettier`) или исключить инструмент. Успех —
    `committed` с отдельным коммитом `style: format <path>` поверх raw-коммита
    либо `no_changes`, если форматировать нечего. Перед `postprocess` не делай
    своих коммитов: он работает только прямо поверх raw-коммита.

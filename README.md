@@ -27,7 +27,7 @@ npm test
 | `HARNESS_MODEL_API_KEY` | Существующий ключ, передаваемый как Bearer |
 | `WORKER_TIMEOUT_MS` | Таймаут подключения и чтения ответа; по умолчанию 60000 |
 | `WORKER_TSCONFIG` | tsconfig по умолчанию для проверки кандидата, путь относительно корня проекта; в монорепе его выбирает оркестратор в `candidate_apply` |
-| `WORKER_POSTPROCESS` | Инструменты `postprocess` в порядке запуска через запятую: `prettier`, `eslint` |
+| `WORKER_POSTPROCESS` | Необязательно: порядок и допустимый набор инструментов `postprocess` через запятую из `eslint`, `prettier`; по умолчанию `eslint,prettier` |
 
 Корень проекта не настраивается: при запуске MCP берёт Git-репозиторий своего
 рабочего каталога (`git rev-parse --show-toplevel`). Session tools работают
@@ -123,9 +123,15 @@ revision и добавляет findings в историю. Устаревший 
 бы один коммит.
 
 `postprocess({ sessionId, packageDir? })` запускается после `committed` и только
-прямо поверх raw-коммита в чистом дереве (иначе `conflict`). Инструменты
-берутся из доверенного `WORKER_POSTPROCESS` (`prettier --write`, `eslint --fix`),
-запускаются без shell и только по путям raw-коммита. Рабочий каталог и поиск
+прямо поверх raw-коммита в чистом дереве (иначе `conflict`). Инструменты —
+`eslint --fix` и `prettier --write` (порядок из `WORKER_POSTPROCESS`, по
+умолчанию сначала eslint), запускаются без shell и только по путям raw-коммита.
+Инструмент запускается, только если он объявлен в `dependencies` или
+`devDependencies` в `package.json` пакета или его родителей до корня репо.
+Версия неважна: те же аргументы работают в ESLint 8 и 9. Не объявлен — шаг
+пропускается с `tool_skipped`; объявлен, но не установлен — `tool_not_found`.
+npm-скрипты вроде `lint` MCP не запускает: это shell-команды, и обычно они
+обрабатывают весь пакет, а не только файлы raw-коммита. Рабочий каталог и поиск
 их бинарников — `packageDir`, по умолчанию каталог tsconfig из
 `candidate_apply`. В монорепе это пакет, и ESLint находит свой конфиг оттуда.
 Целевой файл должен лежать внутри `packageDir`, иначе `outside_package_dir`.

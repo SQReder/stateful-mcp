@@ -56,7 +56,8 @@
 ## Monorepo support (user decision, 2026-10-13)
 
 - [x] Let the orchestrator pass the package tsconfig to `candidate_apply` and `packageDir` to `postprocess`; resolve `tsc`, prettier and eslint from the package and run the tools there (`npm test`: 52 passed).
-- [ ] Re-run the monorepo pilot in corporate Kilo with real ESLint/Prettier configs per package (developer with corporate Kilo).
+- [x] Choose postprocess tools from package.json (package or parents); skip undeclared ones, any ESLint 8/9 or Prettier version (`npm test`: 53 passed).
+- [ ] Re-run the monorepo pilot in corporate Kilo with real ESLint 8/9 and Prettier configs per package (developer with corporate Kilo).
 
 ## Deployment/pilot checks
 
