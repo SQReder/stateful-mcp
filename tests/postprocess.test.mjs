@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
@@ -16,7 +16,12 @@ const sha256 = (text) => createHash('sha256').update(text).digest('hex');
 
 // Fake CLI in the workspace's node_modules: checks its fix flag, rewrites the files after `--`, then exits.
 // prettier uses a string bin; eslint an object bin behind `exports`, which hides package.json from require.resolve.
+// The tool is also declared in the committed root package.json, since postprocess runs only declared tools.
 function tool(f, name, transform, { exit = 0, extra = '' } = {}) {
+  const manifest = join(f.root, 'package.json');
+  const pkg = existsSync(manifest) ? JSON.parse(readFileSync(manifest, 'utf8')) : { private: true };
+  writeFileSync(manifest, JSON.stringify({ ...pkg, devDependencies: { ...pkg.devDependencies, [name]: '*' } }));
+  f.run('add', 'package.json'); f.run('commit', '-q', '-m', `declare ${name}`);
   const dir = join(f.root, 'node_modules', name);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'package.json'), JSON.stringify(name === 'prettier' ? { name, bin: 'cli.cjs' } : { name, bin: { [name]: 'cli.cjs' }, exports: { '.': './cli.cjs' } }));
@@ -92,7 +97,7 @@ test('postprocess is refused without a raw commit or trusted tool list, and is a
   const c = await f.candidate(store, id, PASSING);
   assert.equal((await store.candidateApply(id, c)).status, 'committed');
   store.close();
-  for (const config of [undefined, ' ', 'prettier,black']) {
+  for (const config of ['prettier,black', 'black']) {
     store = f.open('tsconfig.json', config);
     await assert.rejects(store.postprocess(id), { code: 'configuration_error' });
     store.close();
@@ -153,10 +158,12 @@ test('in a monorepo the orchestrator picks the package tsconfig, and postprocess
   mkdirSync(join(f.root, 'packages', 'b'));
   writeFileSync(join(pkg, 'tsconfig.json'), JSON.stringify({ extends: '../../tsconfig.json', include: ['*.ts'] }));
   writeFileSync(join(pkg, 'source.ts'), 'export const value = 1;\n');
+  writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'a', dependencies: {} })); // declares no tools itself
   f.run('add', '.'); f.run('commit', '-q', '-m', 'package a');
   // The fake formatter records its working directory, proving tools run in the package (where ESLint looks up its config).
+  // It is declared only in the root package.json, as hoisted monorepo tooling usually is.
   tool(f, 'prettier', "s => s + '// cwd ' + require('node:path').basename(process.cwd()) + '\\n'");
-  const store = f.open('tsconfig.json', 'prettier');
+  const store = f.open('tsconfig.json'); // default WORKER_POSTPROCESS: eslint, then prettier
   const id = store.start({ objective: 'Add tests', allowedPaths: ['packages/a/value.test.ts'] }).sessionId;
   store.contextSet(id, { files: ['packages/a/source.ts'], brief: 'Test the value', acceptanceCriteria: ['Value is a number'] });
   const c = await f.candidate(store, id, { path: 'packages/a/value.test.ts', content: PASSING });
@@ -172,8 +179,25 @@ test('in a monorepo the orchestrator picks the package tsconfig, and postprocess
   assert.match(wrongPackage.diagnostics.join('\n'), /outside_package_dir/);
   const result = await store.postprocess(id);
   assert.equal(result.status, 'committed', result.diagnostics.join('\n'));
+  assert.match(result.diagnostics.join('\n'), /tool_skipped: eslint/); // no package declares eslint: not an error
   assert.equal(f.run('show', 'HEAD:packages/a/value.test.ts'), `${PASSING}// cwd a\n`);
   assert.equal(f.run('rev-list', '--count', `${raw}..HEAD`).trim(), '2');
+  assert.deepEqual(f.dirty(), []);
+});
+
+test('without declared tools postprocess has nothing to do, and a declared but missing tool is an error', async (t) => {
+  const bare = await rawCommit(t, {}, undefined);
+  const nothing = await bare.store.postprocess(bare.id);
+  assert.equal(nothing.status, 'no_changes');
+  assert.match(nothing.diagnostics.join('\n'), /tool_skipped: eslint[\s\S]*tool_skipped: prettier/);
+  assert.equal(bare.f.head(), bare.raw);
+
+  const { f, store, id, raw } = await rawCommit(t, { prettier: [QUOTES] });
+  rmSync(join(f.root, 'node_modules', 'prettier'), { recursive: true }); // declared in package.json, not installed
+  const missing = await store.postprocess(id);
+  assert.equal(missing.status, 'error');
+  assert.match(missing.diagnostics.join('\n'), /tool_not_found: prettier/);
+  assert.equal(f.head(), raw);
   assert.deepEqual(f.dirty(), []);
 });
 

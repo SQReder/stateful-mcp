@@ -20,7 +20,9 @@ const TYPECHECK_FLAGS = ['--noEmit', '--incremental', 'false', '--composite', 'f
 // Recovery finds the raw commit of an interrupted apply by this trailer instead of exposing SHAs.
 const CANDIDATE_TRAILER = 'Stateful-Worker-Candidate', POSTPROCESS_TRAILER = 'Stateful-Worker-Postprocess';
 // Trusted fix tools and their arguments; WORKER_POSTPROCESS only picks from these and sets the run order.
+// The same arguments work for ESLint 8 and 9 and any Prettier; a tool runs only where package.json declares it.
 const POSTPROCESS_ARGS: Record<string, string[]> = { prettier: ['--write'], eslint: ['--fix'] };
+const DEFAULT_POSTPROCESS = 'eslint,prettier'; // lint fixes first, formatting last
 type ApplyPhase = 'applying' | 'validating' | 'committing' | 'committed' | 'restored' | 'conflict' | 'error'
   | 'postprocessing' | 'postprocess_validating' | 'postprocess_committing' | 'postprocessed' | 'postprocess_failed';
 type Result<Status extends string> = { status: Status; diagnostics: string[]; changedFiles: string[]; hooksModified?: true };
@@ -456,6 +458,20 @@ export class SessionStore {
   private tscPath(dir: string): string | undefined {
     try { return join(dirname(createRequire(join(dir, 'package.json')).resolve('typescript/package.json')), 'bin', 'tsc'); } catch { return undefined; }
   }
+  /** Whether package.json in `dir` or a parent up to the workspace root lists `name` in dependencies or devDependencies. */
+  private declared(name: string, dir: string): boolean {
+    for (let current = dir; ; current = dirname(current)) {
+      const manifest = join(current, 'package.json');
+      if (existsSync(manifest)) {
+        let parsed: Record<string, Record<string, string> | undefined>;
+        try { parsed = JSON.parse(readFileSync(manifest, 'utf8')); } catch {
+          throw new SessionError('invalid_package_json', `${relative(this.root, manifest) || 'package.json'} is not valid JSON; postprocess cannot tell which tools the package uses.`);
+        }
+        if (parsed.dependencies?.[name] || parsed.devDependencies?.[name]) return true;
+      }
+      if (samePath(current, this.root) || dirname(current) === current) return false;
+    }
+  }
   /** The package's own bin entry, resolved from `dir` like typescript; walks up node_modules when `exports` hides package.json. */
   private packageBin(name: string, dir: string): string | undefined {
     try {
@@ -481,9 +497,9 @@ export class SessionStore {
     // Only final outcomes are stored, so a repeat never runs tools, tsc or Git.
     if (candidate.postprocessResult) return candidate.postprocessResult;
     this.assertNoWriter();
-    const names = (this.postprocessTools ?? '').split(',').map(name => name.trim()).filter(Boolean);
-    if (!names.length || names.some(name => !Object.hasOwn(POSTPROCESS_ARGS, name))) {
-      throw new SessionError('configuration_error', `WORKER_POSTPROCESS must list trusted tools in run order, from: ${Object.keys(POSTPROCESS_ARGS).join(', ')}.`);
+    const names = (this.postprocessTools?.trim() || DEFAULT_POSTPROCESS).split(',').map(name => name.trim()).filter(Boolean);
+    if (names.some(name => !Object.hasOwn(POSTPROCESS_ARGS, name))) {
+      throw new SessionError('configuration_error', `WORKER_POSTPROCESS may list only these tools, in run order: ${Object.keys(POSTPROCESS_ARGS).join(', ')}.`);
     }
     const config = this.tsconfigFile(candidate.tsconfig ?? this.tsconfig), tsconfig = config.full;
     // Tools run in the package directory: ESLint flat config is looked up from the working directory, and binaries resolve from there.
@@ -512,9 +528,11 @@ export class SessionStore {
       if (toolPaths.some(path => path.startsWith('..') || isAbsolute(path))) {
         return outcome('error', `outside_package_dir: ${paths.join(', ')} is not inside ${packageRel}; pass the target's package as packageDir.`);
       }
-      const tools = names.map(name => ({ name, bin: this.packageBin(name, packageFull) ?? '' }));
+      // A package without a linter or formatter is normal: such steps are skipped, but a declared tool that is not installed is an error.
+      const skipped = names.filter(name => !this.declared(name, packageFull));
+      const tools = names.filter(name => !skipped.includes(name)).map(name => ({ name, bin: this.packageBin(name, packageFull) ?? '' }));
       const unresolved = tools.filter(tool => !tool.bin).map(tool => tool.name);
-      if (unresolved.length) return outcome('error', `tool_not_found: no ${unresolved.join(', ')} package with a bin entry resolves from ${packageRel}.`);
+      if (unresolved.length) return outcome('error', `tool_not_found: ${unresolved.join(', ')} is declared in package.json but no package with a bin entry resolves from ${packageRel}; install dependencies first.`);
       const tsc = this.tscPath(dirname(tsconfig));
       if (!tsc) return outcome('error', `typescript_not_found: no typescript package resolves from ${config.path}.`);
       const journal = (phase: ApplyPhase, formatted?: Record<string, string>): void => { state.apply = { candidateId: candidate.id, phase, formatted }; this.save(state); };
@@ -523,7 +541,7 @@ export class SessionStore {
       ({ state, candidate } = committed());
       journal('postprocessing');
       try {
-        const notes: string[] = [];
+        const notes = skipped.map(name => `tool_skipped: ${name} is not declared in package.json of ${packageRel} or its parents.`);
         let failure: string[] | undefined;
         for (const { name, bin } of tools) {
           const ran = await this.run(process.execPath, [bin, ...POSTPROCESS_ARGS[name], '--', ...toolPaths], packageFull);
