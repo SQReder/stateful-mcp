@@ -150,14 +150,47 @@ test('draft, rejected, stale and not-the-approved candidates are refused without
   assert.deepEqual(f.dirty(), []);
 });
 
-test('external target/context edits and unrelated dirty files are conflicts without writes', async (t) => {
+test('unstaged and untracked work elsewhere stays out of the commit, while a dirty target or a staged change is a conflict', async (t) => {
+  const f = await fixture(t, { base: BASE });
+  const store = f.open(), id = await f.session(store);
+  const c = await f.candidate(store, id, PASSING), before = f.head();
+  writeFileSync(join(f.root, 'value.test.ts'), 'export const draft = 1;\n');
+  const dirtyTarget = await store.candidateApply(id, c);
+  assert.equal(dirtyTarget.status, 'conflict');
+  assert.match(dirtyTarget.diagnostics.join('\n'), /target_dirty/);
+  assert.equal(readFileSync(f.target, 'utf8'), 'export const draft = 1;\n');
+  writeFileSync(f.target, BASE);
+  writeFileSync(join(f.root, 'tsconfig.src.json'), '{"extends":"./tsconfig.json","include":["source.ts"],"files":[]}');
+  f.run('add', 'tsconfig.src.json');
+  const staged = await store.candidateApply(id, c);
+  assert.equal(staged.status, 'conflict');
+  assert.match(staged.diagnostics.join('\n'), /index_not_clean.*tsconfig\.src\.json/);
+  f.run('restore', '--staged', 'tsconfig.src.json'); // the change stays, unstaged
+  writeFileSync(join(f.root, 'notes.txt'), 'unrelated work');
+  assert.equal((await store.candidateApply(id, c)).status, 'committed');
+  assert.deepEqual(f.committed(before).files, ['value.test.ts']);
+  assert.deepEqual(f.dirty().sort(), [' M tsconfig.src.json', '?? notes.txt']);
+});
+
+test('tsc errors only outside the target, e.g. in unfinished work, do not burn the candidate', async (t) => {
+  const f = await fixture(t, { base: BASE });
+  const store = f.open(), id = await f.session(store);
+  const c = await f.candidate(store, id, PASSING), before = f.head();
+  writeFileSync(join(f.root, 'wip.ts'), 'export const unfinished: string = 1;\n'); // included by tsconfig.json
+  const elsewhere = await store.candidateApply(id, c);
+  assert.equal(elsewhere.status, 'error');
+  assert.match(elsewhere.diagnostics.join('\n'), /typecheck_failed_elsewhere[\s\S]*wip\.ts/);
+  assert.equal(readFileSync(f.target, 'utf8'), BASE);
+  assert.equal(f.head(), before);
+  assert.equal(store.status(id).details.candidates[0].applyResult, undefined);
+  rmSync(join(f.root, 'wip.ts'));
+  assert.equal((await store.candidateApply(id, c)).status, 'committed');
+});
+
+test('external target and context edits are conflicts without writes', async (t) => {
   const f = await fixture(t, { base: BASE });
   const store = f.open(), id = await f.session(store);
   const c = await f.candidate(store, id, PASSING);
-  writeFileSync(join(f.root, 'notes.txt'), 'unrelated work');
-  assert.equal((await store.candidateApply(id, c)).status, 'conflict');
-  assert.equal(readFileSync(f.target, 'utf8'), BASE);
-  rmSync(join(f.root, 'notes.txt'));
   writeFileSync(f.target, 'export const external = 1;\n');
   f.run('commit', '-q', '-am', 'external target edit');
   const targetConflict = await store.candidateApply(id, c);

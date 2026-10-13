@@ -103,10 +103,17 @@ test('postprocess is refused without a raw commit or trusted tool list, and is a
     store.close();
   }
   store = f.open('tsconfig.json', 'prettier');
-  writeFileSync(join(f.root, 'notes.txt'), 'unrelated work');
+  writeFileSync(f.target, `${PASSING}// developer draft\n`);
   const dirty = await store.postprocess(id);
   assert.equal(dirty.status, 'conflict');
-  assert.match(dirty.diagnostics.join('\n'), /dirty_worktree.*notes\.txt/);
+  assert.match(dirty.diagnostics.join('\n'), /target_dirty/);
+  writeFileSync(f.target, PASSING);
+  writeFileSync(join(f.root, 'notes.txt'), 'unrelated work');
+  f.run('add', 'notes.txt');
+  const staged = await store.postprocess(id);
+  assert.equal(staged.status, 'conflict');
+  assert.match(staged.diagnostics.join('\n'), /index_not_clean.*notes\.txt/);
+  f.run('rm', '-q', '--cached', 'notes.txt');
   rmSync(join(f.root, 'notes.txt'));
   writeFileSync(join(f.root, 'source.ts'), 'export const value = 2;\n');
   f.run('commit', '-q', '-am', 'developer commit');
