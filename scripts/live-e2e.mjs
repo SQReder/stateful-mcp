@@ -62,7 +62,9 @@ try {
       if (applied.status === 'committed') {
         summary.commitFiles = git('diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD').trim().split('\n');
         summary.commitSubject = git('log', '-1', '--format=%s');
-        summary.treeClean = git('status', '--porcelain').trim() === '';
+        // The MCP store is untracked here on purpose: the clean check of candidate_apply skips it too.
+        summary.dirtyPaths = git('status', '--porcelain', '--untracked-files=all').split('\n').filter(line => line && !line.includes('.stateful-worker/'));
+        summary.treeClean = summary.dirtyPaths.length === 0;
         summary.ok = summary.treeClean && summary.commitFiles.join() === 'clamp.test.ts';
       }
     }
