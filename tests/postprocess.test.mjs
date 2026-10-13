@@ -146,6 +146,37 @@ test('a hook that refuses the style commit leaves the raw commit and file as the
   assert.equal(f.committed(raw).blob, FORMATTED);
 });
 
+test('in a monorepo the orchestrator picks the package tsconfig, and postprocess runs the tools from that package', async (t) => {
+  const f = await fixture(t);
+  const pkg = join(f.root, 'packages', 'a');
+  mkdirSync(pkg, { recursive: true });
+  mkdirSync(join(f.root, 'packages', 'b'));
+  writeFileSync(join(pkg, 'tsconfig.json'), JSON.stringify({ extends: '../../tsconfig.json', include: ['*.ts'] }));
+  writeFileSync(join(pkg, 'source.ts'), 'export const value = 1;\n');
+  f.run('add', '.'); f.run('commit', '-q', '-m', 'package a');
+  // The fake formatter records its working directory, proving tools run in the package (where ESLint looks up its config).
+  tool(f, 'prettier', "s => s + '// cwd ' + require('node:path').basename(process.cwd()) + '\\n'");
+  const store = f.open('tsconfig.json', 'prettier');
+  const id = store.start({ objective: 'Add tests', allowedPaths: ['packages/a/value.test.ts'] }).sessionId;
+  store.contextSet(id, { files: ['packages/a/source.ts'], brief: 'Test the value', acceptanceCriteria: ['Value is a number'] });
+  const c = await f.candidate(store, id, { path: 'packages/a/value.test.ts', content: PASSING });
+  const rootConfig = await store.candidateApply(id, c);
+  assert.equal(rootConfig.status, 'error');
+  assert.match(rootConfig.diagnostics.join('\n'), /target_not_in_typecheck/); // the default root tsconfig does not cover the package
+  await assert.rejects(store.candidateApply(id, c, '../outside.json'), { code: 'invalid_path' });
+  await assert.rejects(store.candidateApply(id, c, 'packages/a/source.ts'), { code: 'invalid_path' });
+  const raw = f.head();
+  assert.equal((await store.candidateApply(id, c, 'packages/a/tsconfig.json')).status, 'committed');
+  const wrongPackage = await store.postprocess(id, 'packages/b');
+  assert.equal(wrongPackage.status, 'error');
+  assert.match(wrongPackage.diagnostics.join('\n'), /outside_package_dir/);
+  const result = await store.postprocess(id);
+  assert.equal(result.status, 'committed', result.diagnostics.join('\n'));
+  assert.equal(f.run('show', 'HEAD:packages/a/value.test.ts'), `${PASSING}// cwd a\n`);
+  assert.equal(f.run('rev-list', '--count', `${raw}..HEAD`).trim(), '2');
+  assert.deepEqual(f.dirty(), []);
+});
+
 test('eslint exit 1 keeps its fixes after prettier with lint_problems_remain; exit 2 returns the file to the raw commit', async (t) => {
   const lint = await rawCommit(t, { prettier: [QUOTES], eslint: [LINT, { exit: 1, extra: "console.log('1 problem remains');" }] });
   const result = await lint.store.postprocess(lint.id);

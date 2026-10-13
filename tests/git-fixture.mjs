@@ -38,7 +38,8 @@ export async function fixture(t, { base = null, git = true } = {}) {
   const replies = [];
   const backend = createServer(async (req, res) => {
     for await (const _ of req);
-    res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ path: 'value.test.ts', content: replies.shift() }) }, finish_reason: 'stop' }] }));
+    const reply = replies.shift(); // file content for value.test.ts, or a whole { path, content } artifact
+    res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(typeof reply === 'string' ? { path: 'value.test.ts', content: reply } : reply) }, finish_reason: 'stop' }] }));
   });
   backend.listen(0, '127.0.0.1');
   await once(backend, 'listening');

@@ -38,6 +38,7 @@ interface Candidate {
   reviews: Array<{ verdict: 'approve' | 'reject'; findings: ReviewFinding[]; contextRevision: number }>;
   applyResult?: ApplyResult;
   rawCommit?: string; // internal: postprocess runs only directly on this commit
+  tsconfig?: string; // internal: the tsconfig the raw commit was validated with; postprocess reuses it
   postprocessResult?: PostprocessResult;
 }
 const artifactSchema = z.object({ path: z.string(), content: z.string().refine(value => value.trim().length > 0) }).strict();
@@ -240,8 +241,8 @@ export class SessionStore {
     if (base === null) unlinkSync(full); else writeFileSync(full, base);
     return 'restored';
   }
-  private run(file: string, args: string[]): Promise<CommandResult> {
-    return new Promise(resolve => execFile(file, args, { cwd: this.root, env: commandEnv(), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_OUTPUT_LIMIT, windowsHide: true },
+  private run(file: string, args: string[], cwd = this.root): Promise<CommandResult> {
+    return new Promise(resolve => execFile(file, args, { cwd, env: commandEnv(), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_OUTPUT_LIMIT, windowsHide: true },
       (error, stdout, stderr) => resolve({ code: !error ? 0 : error.killed ? `killed (${error.signal ?? 'timeout or output limit'})` : error.code ?? 'failed', stdout, stderr })));
   }
   /** Unstages only the target; a new file is dropped from the index, since `restore --staged` fails for paths absent from HEAD. */
@@ -345,7 +346,7 @@ export class SessionStore {
     const status = await this.run('git', ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
     return status.code === 0 ? statusPaths(status.stdout) : null;
   }
-  async candidateApply(id: string, candidateId: string): Promise<ApplyResult> {
+  async candidateApply(id: string, candidateId: string, tsconfigPath?: string): Promise<ApplyResult> {
     const approved = (): { state: Session; candidate: Candidate } => {
       const state = this.ready(id), candidate = this.candidate(state, candidateId);
       if (candidate.contextRevision !== state.contextRevision) throw new SessionError('stale_candidate', 'Candidate is stale; generate and review a new version on the current revision.');
@@ -356,7 +357,7 @@ export class SessionStore {
     // Only final outcomes are stored (a completed failed typecheck or an existing commit), so a repeat never touches Git or tsc.
     if (candidate.applyResult) return candidate.applyResult;
     this.assertNoWriter();
-    const tsconfig = this.trustedTsconfig();
+    const config = this.tsconfigFile(tsconfigPath ?? this.tsconfig), tsconfig = config.full;
     this.applyRunning = true;
     try {
       const dirty = await this.changedPaths();
@@ -370,8 +371,8 @@ export class SessionStore {
       const full = this.safePath(candidate.path, false);
       if (!statSync(dirname(full), { throwIfNoEntry: false })?.isDirectory()) return outcome('error', `missing_directory: parent of ${candidate.path} must already exist.`);
       if (candidate.content === base) return outcome('no_changes');
-      const tsc = this.tscPath();
-      if (!tsc) return outcome('error', 'typescript_not_found: the workspace must resolve its own typescript package.');
+      const tsc = this.tscPath(dirname(tsconfig));
+      if (!tsc) return outcome('error', `typescript_not_found: no typescript package resolves from ${config.path}.`);
       const journal = (phase: ApplyPhase, head?: string): void => { state.apply = { candidateId, phase, head }; this.save(state); };
       // Set before staging and never cleared: the exception path must not trust the in-memory phase, which journal() changes before saving.
       let committingHead: string | undefined;
@@ -382,7 +383,7 @@ export class SessionStore {
         const { listed, checked } = await this.typecheck(tsc, tsconfig, full);
         let failure: ApplyResult, final = false;
         if (!checked) {
-          failure = outcome('error', `target_not_in_typecheck: tsc --listFilesOnly -p ${this.tsconfig} does not include ${candidate.path}; a typecheck without the target is not validation.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed)));
+          failure = outcome('error', `target_not_in_typecheck: tsc --listFilesOnly -p ${config.path} does not include ${candidate.path}; a typecheck without the target is not validation. Apply again with the tsconfig of the target's package.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed)));
         } else if (checked.code === 0) {
           const changed = await this.changedPaths() ?? [];
           const foreign = changed.filter(path => !samePath(path, candidate.path));
@@ -395,6 +396,7 @@ export class SessionStore {
             failure = outcome('error', 'head_unavailable: the repository needs an initial commit to commit the candidate on.', ...commandDiagnostics(head));
           } else {
             committingHead = head.stdout.trim();
+            candidate.tsconfig = config.path; // saved with the journal, so a commit recovered after a crash keeps it too
             journal('committing', committingHead);
             const added = await this.run('git', ['--literal-pathspecs', 'add', '--', candidate.path]);
             const commit = added.code !== 0 ? added
@@ -439,19 +441,26 @@ export class SessionStore {
       throw new SessionError('apply_busy', 'Another apply or postprocess is in progress in this workspace.');
     }
   }
-  private trustedTsconfig(): string {
-    if (!this.tsconfig?.trim()) throw new SessionError('configuration_error', 'Missing WORKER_TSCONFIG: candidate_apply and postprocess need a trusted workspace-relative tsconfig.');
-    return this.safePath(this.tsconfig, true);
+  /**
+   * The validation tsconfig: chosen by the orchestrator per apply (one per package in a monorepo) or WORKER_TSCONFIG by default.
+   * It is a workspace JSON file, never a command; the --listFilesOnly gate still proves it includes the target.
+   */
+  private tsconfigFile(path: string | undefined): { path: string; full: string } {
+    if (!path?.trim()) throw new SessionError('configuration_error', 'No tsconfig: pass tsconfig (the target package\'s config) or set WORKER_TSCONFIG.');
+    if (!/\.json$/i.test(path)) throw new SessionError('invalid_path', 'tsconfig must be a workspace-relative .json file.');
+    const full = this.safePath(path, true);
+    if (!statSync(full).isFile()) throw new SessionError('invalid_path', 'tsconfig must be a regular file.');
+    return { path: path.replaceAll('\\', '/'), full };
   }
-  private tscPath(): string | undefined {
-    try { return join(dirname(createRequire(join(this.root, 'package.json')).resolve('typescript/package.json')), 'bin', 'tsc'); } catch { return undefined; }
+  /** The compiler nearest to `dir`, so a package's own typescript wins over a hoisted one. */
+  private tscPath(dir: string): string | undefined {
+    try { return join(dirname(createRequire(join(dir, 'package.json')).resolve('typescript/package.json')), 'bin', 'tsc'); } catch { return undefined; }
   }
-  /** The package's own bin entry, resolved from the workspace like typescript; walks up node_modules when `exports` hides package.json. */
-  private packageBin(name: string): string | undefined {
+  /** The package's own bin entry, resolved from `dir` like typescript; walks up node_modules when `exports` hides package.json. */
+  private packageBin(name: string, dir: string): string | undefined {
     try {
       let manifest: string;
-      try { manifest = createRequire(join(this.root, 'package.json')).resolve(`${name}/package.json`); } catch {
-        let dir = this.root;
+      try { manifest = createRequire(join(dir, 'package.json')).resolve(`${name}/package.json`); } catch {
         while (!existsSync(manifest = join(dir, 'node_modules', name, 'package.json')) && dirname(dir) !== dir) dir = dirname(dir);
       }
       const bin: unknown = JSON.parse(readFileSync(manifest, 'utf8')).bin;
@@ -460,7 +469,7 @@ export class SessionStore {
     } catch { return undefined; }
   }
   /** Runs the trusted fix tools on the raw commit's paths only and commits their changes separately after a passing typecheck. */
-  async postprocess(id: string): Promise<PostprocessResult> {
+  async postprocess(id: string, packageDir?: string): Promise<PostprocessResult> {
     const committed = (): { state: Session; candidate: Candidate; raw: string } => {
       const state = this.ready(id), candidate = state.apply && this.candidate(state, state.apply.candidateId);
       if (candidate?.applyResult?.status !== 'committed' || !candidate.rawCommit) {
@@ -476,7 +485,12 @@ export class SessionStore {
     if (!names.length || names.some(name => !Object.hasOwn(POSTPROCESS_ARGS, name))) {
       throw new SessionError('configuration_error', `WORKER_POSTPROCESS must list trusted tools in run order, from: ${Object.keys(POSTPROCESS_ARGS).join(', ')}.`);
     }
-    const tsconfig = this.trustedTsconfig();
+    const config = this.tsconfigFile(candidate.tsconfig ?? this.tsconfig), tsconfig = config.full;
+    // Tools run in the package directory: ESLint flat config is looked up from the working directory, and binaries resolve from there.
+    // Default: the directory of the tsconfig the raw commit was validated with, which is the package in a monorepo.
+    const packageRel = packageDir ?? dirname(config.path);
+    const packageFull = ['.', ''].includes(packageRel) ? this.root : this.safePath(packageRel, true);
+    if (!statSync(packageFull).isDirectory()) throw new SessionError('invalid_path', 'packageDir must be a workspace directory.');
     this.applyRunning = true;
     try {
       const dirty = await this.changedPaths();
@@ -493,11 +507,16 @@ export class SessionStore {
       if (paths.length !== 1 || !samePath(paths[0], candidate.path) || !rawMessage.includes(`${CANDIDATE_TRAILER}: ${candidate.id}`)) {
         return outcome('error', `raw_commit_mismatch: the recorded raw commit is not this candidate's single-target commit; nothing was changed: ${paths.join(', ') || 'no paths'}`);
       }
-      const tools = names.map(name => ({ name, bin: this.packageBin(name) ?? '' }));
+      // ESLint ignores files outside its base directory, which would silently look like no_changes.
+      const toolPaths = paths.map(path => relative(packageFull, join(this.root, path)));
+      if (toolPaths.some(path => path.startsWith('..') || isAbsolute(path))) {
+        return outcome('error', `outside_package_dir: ${paths.join(', ')} is not inside ${packageRel}; pass the target's package as packageDir.`);
+      }
+      const tools = names.map(name => ({ name, bin: this.packageBin(name, packageFull) ?? '' }));
       const unresolved = tools.filter(tool => !tool.bin).map(tool => tool.name);
-      if (unresolved.length) return outcome('error', `tool_not_found: the workspace must resolve its own ${unresolved.join(', ')} package with a bin entry.`);
-      const tsc = this.tscPath();
-      if (!tsc) return outcome('error', 'typescript_not_found: the workspace must resolve its own typescript package.');
+      if (unresolved.length) return outcome('error', `tool_not_found: no ${unresolved.join(', ')} package with a bin entry resolves from ${packageRel}.`);
+      const tsc = this.tscPath(dirname(tsconfig));
+      if (!tsc) return outcome('error', `typescript_not_found: no typescript package resolves from ${config.path}.`);
       const journal = (phase: ApplyPhase, formatted?: Record<string, string>): void => { state.apply = { candidateId: candidate.id, phase, formatted }; this.save(state); };
       const final = (result: PostprocessResult, phase: ApplyPhase): PostprocessResult => { candidate.postprocessResult = result; journal(phase); return result; };
       // Re-read after the last await, so the busy journal saved next cannot overwrite a concurrent context_set, review or chat.
@@ -507,7 +526,7 @@ export class SessionStore {
         const notes: string[] = [];
         let failure: string[] | undefined;
         for (const { name, bin } of tools) {
-          const ran = await this.run(process.execPath, [bin, ...POSTPROCESS_ARGS[name], '--', ...paths]);
+          const ran = await this.run(process.execPath, [bin, ...POSTPROCESS_ARGS[name], '--', ...toolPaths], packageFull);
           if (ran.code === 0) continue;
           // eslint exits 1 when it applied its fixes but problems it cannot fix remain; the typecheck still judges the result.
           if (name === 'eslint' && ran.code === 1) { notes.push(capped('lint_problems_remain: eslint applied its fixes; remaining problems', ran.stdout || ran.stderr)); continue; }
@@ -551,7 +570,7 @@ export class SessionStore {
             failure = ['commit_failed: Git or a hook refused the postprocess commit; the raw commit stays and postprocess can run again.', ...commandDiagnostics(commit),
               ...(unstaged.code === 0 ? [] : [`unstage_failed: ${touched.join(', ')} may still be staged.`, ...commandDiagnostics(unstaged)])];
           } else if (!checked) {
-            failure = [`target_not_in_typecheck: tsc --listFilesOnly -p ${this.tsconfig} does not include ${candidate.path}; a typecheck without the target is not validation.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed))];
+            failure = [`target_not_in_typecheck: tsc --listFilesOnly -p ${config.path} does not include ${candidate.path}; a typecheck without the target is not validation.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed))];
           } else {
             // Only a real tsc exit code judges the formatting; a timeout or kill stays retryable.
             completed = typeof checked.code === 'number';

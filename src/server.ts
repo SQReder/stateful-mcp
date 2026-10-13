@@ -105,21 +105,23 @@ server.registerTool('candidate_review', {
 }, ({ sessionId, candidateId, verdict, findings }) => sessionResult(store => store.candidateReview(sessionId, candidateId, verdict, findings)));
 
 server.registerTool('candidate_apply', {
-  description: 'Write one approved, current-revision candidate into a clean Git workspace and typecheck it with the workspace tsc and trusted WORKER_TSCONFIG (must include the target). '
+  description: 'Write one approved, current-revision candidate into a clean Git workspace and typecheck it with the tsc nearest to the chosen tsconfig. '
+    + 'tsconfig: workspace-relative .json of the target\'s package (needed in monorepos); default WORKER_TSCONFIG. It must include the target, otherwise error target_not_in_typecheck, which can be retried with another tsconfig. '
     + 'On success stages only the target and creates one local commit with Git hooks enabled (no push). '
     + 'Returns status committed (hooksModified: true plus a candidate->committed diff when hooks changed the file and it passed the typecheck again), validation_failed (diagnostics, file restored), conflict (dirty tree, changed snapshots/target or external edit; nothing overwritten), no_changes or error. '
     + 'Error commit_failed (e.g. a hook refused) restores the file and may be retried; commit_scope_violation and hooks_broke_typecheck keep the commit and are final. '
     + 'Session/candidate refusals (not approved, stale, busy, missing configuration) are tool errors with a code and write nothing. A failed typecheck is final: generate and review a new one. Repeating a finished apply returns the stored result without a new commit.',
-  inputSchema: z.object({ sessionId: text, candidateId: text }).strict(),
+  inputSchema: z.object({ sessionId: text, candidateId: text, tsconfig: text.optional() }).strict(),
   annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
-}, ({ sessionId, candidateId }) => sessionResult(store => store.candidateApply(sessionId, candidateId)));
+}, ({ sessionId, candidateId, tsconfig }) => sessionResult(store => store.candidateApply(sessionId, candidateId, tsconfig)));
 
 server.registerTool('postprocess', {
   description: 'After candidate_apply returned committed and directly on top of that raw commit in a clean tree: run the trusted WORKER_POSTPROCESS tools (prettier --write, eslint --fix, in configured order) on the raw commit\'s paths only, re-run the typecheck and create a separate style commit with Git hooks enabled (no push). '
     + 'Returns status committed, no_changes, failed (tool or typecheck failure; files returned to the raw commit, which always stays), conflict (moved HEAD, dirty tree or files changed meanwhile; nothing overwritten) or error (e.g. postprocess_scope_violation when a tool touched other paths; nothing reverted). '
-    + 'eslint exit 1 keeps its fixes and adds lint_problems_remain. Repeating a finished postprocess returns the stored result; commit_failed and tool failures can be retried.',
-  inputSchema: z.object({ sessionId: text }).strict(),
+    + 'eslint exit 1 keeps its fixes and adds lint_problems_remain. Repeating a finished postprocess returns the stored result; commit_failed and tool failures can be retried. '
+    + 'packageDir: workspace-relative directory of the target\'s package where the tools run and resolve (ESLint finds its config from there); default: the directory of the tsconfig used by candidate_apply. The typecheck reuses that tsconfig.',
+  inputSchema: z.object({ sessionId: text, packageDir: text.optional() }).strict(),
   annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
-}, ({ sessionId }) => sessionResult(store => store.postprocess(sessionId)));
+}, ({ sessionId, packageDir }) => sessionResult(store => store.postprocess(sessionId, packageDir)));
 
 await server.connect(new StdioServerTransport());
