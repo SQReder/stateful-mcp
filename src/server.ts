@@ -110,13 +110,17 @@ server.registerTool('candidate_review', {
 server.registerTool('candidate_apply', {
   description: 'Write one approved, current-revision candidate (all its files that differ from their bases) into the Git workspace and typecheck it with the tsc nearest to the chosen tsconfig. '
     + 'tsconfig: workspace-relative .json of the targets\' package (needed in monorepos); default WORKER_TSCONFIG. It must include every TypeScript file of the candidate, otherwise error target_not_in_typecheck, which can be retried with another tsconfig. '
+    + 'After a passing typecheck runs every test file of the candidate (*.test.* / *.spec.*, JS or TS) with the package\'s runner, without a shell, from packageDir with CI=1: vitest run if declared in package.json of packageDir or a parent, else jest --ci --runTestsByPath. '
+    + 'packageDir: workspace-relative directory of the tests\' package; default: the directory of the tsconfig. Test files outside it give error outside_package_dir before anything is written. '
+    + 'Diagnostics note tests_passed, or tests_skipped when the candidate has no test files or no runner is declared. Error tests_failed (runner output included), tests_not_completed (timeout or kill) or test_runner_not_found (declared, not installed) restores the files and is not final: the same candidate may be applied again or a new one generated. '
+    + 'Files the test run writes (snapshots, coverage) give error unexpected_changes; nothing is reverted. '
     + 'On success stages only the candidate files and creates one local commit "<commitType>: <objective>" with Git hooks enabled (no push). '
     + 'Returns status committed (hooksModified: true plus a candidate->committed diff when hooks changed files and they passed the typecheck again), validation_failed (diagnostics, files restored), conflict (dirty or changed targets, changed snapshots or external edits; nothing overwritten), no_changes or error. '
     + 'Error commit_failed (e.g. a hook refused) restores the files and may be retried; commit_scope_violation and hooks_broke_typecheck keep the commit and are final. '
     + 'Session/candidate refusals (not approved, stale, busy, missing configuration) are tool errors with a code and write nothing. A failed typecheck is final: generate and review a new one. Repeating a finished apply returns the stored result without a new commit.',
-  inputSchema: z.object({ sessionId: text, candidateId: text, tsconfig: text.optional() }).strict(),
+  inputSchema: z.object({ sessionId: text, candidateId: text, tsconfig: text.optional(), packageDir: text.optional() }).strict(),
   annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
-}, ({ sessionId, candidateId, tsconfig }) => sessionResult(store => store.candidateApply(sessionId, candidateId, tsconfig)));
+}, ({ sessionId, candidateId, tsconfig, packageDir }) => sessionResult(store => store.candidateApply(sessionId, candidateId, tsconfig, packageDir)));
 
 server.registerTool('postprocess', {
   description: 'After candidate_apply returned committed and directly on top of that raw commit in a clean tree: run eslint --fix and prettier --write (order from WORKER_POSTPROCESS, default eslint then prettier) on the raw commit\'s paths only, re-run the typecheck and create a separate style commit with Git hooks enabled (no push). '

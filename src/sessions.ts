@@ -58,8 +58,11 @@ export class SessionError extends Error {
 const POSTPROCESS_BUSY: string[] = ['postprocessing', 'postprocess_validating', 'postprocess_committing'];
 const BUSY = ['applying', 'validating', 'committing', ...POSTPROCESS_BUSY], BUSY_PHASES = `(${BUSY.map(phase => `'${phase}'`).join(', ')})`;
 const applying = (state: Session): boolean => BUSY.includes(state.apply?.phase ?? '');
-// Windows env names are case-insensitive, so the key must be dropped under any spelling.
-const commandEnv = (): NodeJS.ProcessEnv => Object.fromEntries(Object.entries(process.env).filter(([name]) => name.toUpperCase() !== 'HARNESS_MODEL_API_KEY'));
+// Windows env names are case-insensitive, so the key and every overridden name must be dropped under any spelling.
+const commandEnv = (extra: Record<string, string> = {}): NodeJS.ProcessEnv => ({ ...Object.fromEntries(Object.entries(process.env)
+  .filter(([name]) => !['HARNESS_MODEL_API_KEY', ...Object.keys(extra)].includes(name.toUpperCase()))), ...extra });
+// In CI neither vitest nor jest writes new snapshots or watches; colour codes would only clutter the diagnostics.
+const TEST_ENV = { CI: '1', FORCE_COLOR: '0' };
 const outcome = <Status extends string>(status: Status, ...diagnostics: string[]): Result<Status> => ({ status, diagnostics, changedFiles: [] });
 const capped = (label: string, text: string): string => text.length <= DIAGNOSTIC_LIMIT ? `${label}: ${text}`
   : `${label} (truncated to first ${DIAGNOSTIC_LIMIT} of ${text.length} chars): ${text.slice(0, DIAGNOSTIC_LIMIT)}`;
@@ -69,6 +72,8 @@ const slash = (path: string): string => path.replaceAll('\\', '/');
 const changes = (candidate: Candidate): CandidateFile[] => candidate.files.filter(file => file.content !== (file.base?.content ?? null));
 // Files the typecheck must include; others, such as .json, are written and committed without being part of the program.
 const TYPESCRIPT = /\.(?:ts|tsx|mts|cts)$/i;
+// Test files the apply runs with the package's runner: *.test.* and *.spec.* with a JS or TS extension.
+const TEST_FILE = /\.(?:test|spec)\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/i;
 const MAX_SUBJECT_OBJECTIVE = 72;
 /** Sessions stored before multi-file candidates: the commit type defaults to test and a single-file candidate moves into `files`. */
 const upgrade = (state: Session): Session => {
@@ -270,8 +275,8 @@ export class SessionStore {
   private restoreAll(files: CandidateFile[]): string[] {
     return files.filter(file => { try { return this.restore(file) === 'conflict'; } catch { return true; } }).map(file => file.path);
   }
-  private run(file: string, args: string[], cwd = this.root): Promise<CommandResult> {
-    return new Promise(resolve => execFile(file, args, { cwd, env: commandEnv(), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_OUTPUT_LIMIT, windowsHide: true },
+  private run(file: string, args: string[], cwd = this.root, env: Record<string, string> = {}): Promise<CommandResult> {
+    return new Promise(resolve => execFile(file, args, { cwd, env: commandEnv(env), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_OUTPUT_LIMIT, windowsHide: true },
       (error, stdout, stderr) => resolve({ code: !error ? 0 : error.killed ? `killed (${error.signal ?? 'timeout or output limit'})` : error.code ?? 'failed', stdout, stderr })));
   }
   /** Unstages only this file; a new file is dropped from the index, since `restore --staged` fails for paths absent from HEAD. */
@@ -381,6 +386,7 @@ export class SessionStore {
     if (modified.some(file => blobs[expected.indexOf(file)].code !== 0) || left.length) {
       return { status: 'error', diagnostics: ['committed_unverified: hooks changed or removed committed files and the worktree differs from HEAD, so the commit was not typechecked; nothing was reverted.', diff, ...leftDiagnostics], changedFiles: paths };
     }
+    // Only the typecheck is repeated, never the tests: hooks must not change behaviour.
     const { listed, checked } = await this.typecheck(tsc, tsconfig, required);
     // Errors only in other files are not the hooks' doing: the committed files themselves still typecheck.
     if (checked && (checked.code === 0 || errorsOnlyElsewhere(checked, required))) {
@@ -424,7 +430,7 @@ export class SessionStore {
     const status = await this.run('git', ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
     return status.code === 0 ? statusPaths(status.stdout) : null;
   }
-  async candidateApply(id: string, candidateId: string, tsconfigPath?: string): Promise<ApplyResult> {
+  async candidateApply(id: string, candidateId: string, tsconfigPath?: string, packageDir?: string): Promise<ApplyResult> {
     const approved = (): { state: Session; candidate: Candidate } => {
       const state = this.ready(id), candidate = this.candidate(state, candidateId);
       if (candidate.contextRevision !== state.contextRevision) throw new SessionError('stale_candidate', 'Candidate is stale; generate and review a new version on the current revision.');
@@ -435,9 +441,15 @@ export class SessionStore {
     // Only final outcomes are stored (a completed failed typecheck or an existing commit), so a repeat never touches Git or tsc.
     if (candidate.applyResult) return candidate.applyResult;
     this.assertNoWriter();
-    const config = this.tsconfigFile(tsconfigPath ?? this.tsconfig), tsconfig = config.full;
+    const config = this.tsconfigFile(tsconfigPath ?? this.tsconfig), tsconfig = config.full, pkg = this.packageDirectory(packageDir, config.path);
     // Every candidate file is checked and judges the typecheck; only the changed ones are written and committed.
     const paths = candidate.files.map(file => file.path), written = changes(candidate), writtenPaths = written.map(file => file.path);
+    // The runner only finds tests inside its package, and the tests run from it.
+    const testPaths = this.inPackage(pkg, paths.filter(path => TEST_FILE.test(path)));
+    if (testPaths.outside.length) return outcome('error', `outside_package_dir: ${testPaths.outside.join(', ')} is not inside ${pkg.rel}; pass the tests' package as packageDir.`);
+    // vitest takes no `--` before its file filters, so a path starting with "-" would be read as a runner option.
+    const optionLike = testPaths.relative.filter(path => path.startsWith('-'));
+    if (optionLike.length) return outcome('error', `invalid_test_path: ${optionLike.join(', ')} would be read as a test runner option; rename the test file.`);
     this.applyRunning = true;
     try {
       // Other unstaged or untracked work may stay: only the targets must be untouched and the index empty.
@@ -469,9 +481,14 @@ export class SessionStore {
         const uncommitted = this.dirtyInProgram(listed, baseline, paths);
         const uncommittedNote = uncommitted.length ? [`validated_with_uncommitted: the typecheck included uncommitted files, so the raw commit may not compile without them: ${uncommitted.join(', ')}`] : [];
         let failure: ApplyResult, final = false;
+        const typechecked = checked && (checked.code === 0 || errorsOnlyElsewhere(checked, paths));
+        // Tests run only after a passing typecheck and before the change check, which then also catches files they write.
+        const tested = typechecked ? await this.runTests(testPaths.relative, pkg) : undefined;
         if (!checked) {
           failure = outcome('error', `target_not_in_typecheck: tsc --listFilesOnly -p ${config.path} does not include ${missing.join(', ')}; a typecheck without the candidate's TypeScript files is not validation. Apply again with the tsconfig of the targets' package.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed)));
-        } else if (checked.code === 0 || errorsOnlyElsewhere(checked, paths)) {
+        } else if (tested?.failure) {
+          failure = tested.failure; // never final: a flake or unfinished work elsewhere may cause it, so the supervisor decides
+        } else if (typechecked) {
           // Passed: the candidate files have no type errors. Errors only in other files (user decision: pre-existing or unfinished work
           // in a monorepo) are reported, not blocking. New changes besides the targets (paths not dirty before) mean validation wrote files,
           // and every written file must show as changed (one ignored by Git would silently miss the commit).
@@ -508,7 +525,7 @@ export class SessionStore {
               const judged = await this.committedResult(committingHead, created, written, baseline, tsc, tsconfig, paths);
               if (judged.status === 'committed') candidate.rawCommit = created;
               const prefix = moved ? ['commit_exit_nonzero: git reported a failure after creating the commit; the commit was kept.', ...commandDiagnostics(commit)] : [];
-              candidate.applyResult = { ...judged, diagnostics: [...prefix, ...judged.diagnostics, ...uncommittedNote, ...outsideNote(checked)] };
+              candidate.applyResult = { ...judged, diagnostics: [...prefix, ...judged.diagnostics, ...uncommittedNote, ...outsideNote(checked), ...tested?.notes ?? []] };
               journal(candidate.applyResult.status === 'committed' ? 'committed' : 'error');
               return candidate.applyResult;
             }
@@ -570,7 +587,7 @@ export class SessionStore {
       if (existsSync(manifest)) {
         let parsed: Record<string, Record<string, string> | undefined>;
         try { parsed = JSON.parse(readFileSync(manifest, 'utf8')); } catch {
-          throw new SessionError('invalid_package_json', `${relative(this.root, manifest) || 'package.json'} is not valid JSON; postprocess cannot tell which tools the package uses.`);
+          throw new SessionError('invalid_package_json', `${relative(this.root, manifest) || 'package.json'} is not valid JSON; cannot tell which tools or test runner the package uses.`);
         }
         if (parsed.dependencies?.[name] || parsed.devDependencies?.[name]) return true;
       }
@@ -588,6 +605,39 @@ export class SessionStore {
       const entry = typeof bin === 'string' ? bin : typeof bin === 'object' && bin ? (bin as Record<string, unknown>)[name] : undefined;
       return typeof entry === 'string' ? join(dirname(manifest), entry) : undefined;
     } catch { return undefined; }
+  }
+  /**
+   * The package directory tools and test runners run in and resolve from: `packageDir` or, by default, the directory of the tsconfig
+   * used, which is the package in a monorepo.
+   */
+  private packageDirectory(packageDir: string | undefined, tsconfigPath: string): { rel: string; full: string } {
+    const rel = packageDir ?? dirname(tsconfigPath);
+    const full = ['.', ''].includes(rel) ? this.root : this.safePath(rel, true);
+    if (!statSync(full).isDirectory()) throw new SessionError('invalid_path', 'packageDir must be a workspace directory.');
+    return { rel, full };
+  }
+  /** Workspace-relative `paths` relative to the package directory, and those outside it. */
+  private inPackage(pkg: { full: string }, paths: string[]): { relative: string[]; outside: string[] } {
+    const inner = paths.map(path => relative(pkg.full, join(this.root, path)));
+    return { relative: inner, outside: paths.filter((_, index) => inner[index].startsWith('..') || isAbsolute(inner[index])) };
+  }
+  /**
+   * Runs the candidate's test files (`tests`, relative to the package) with the package's runner, without a shell, from the package
+   * directory. A failure is never final.
+   * Postprocess and the hook re-typecheck do not run tests again: formatting and hooks must not change behaviour.
+   */
+  private async runTests(tests: string[], pkg: { rel: string; full: string }): Promise<{ notes: string[]; failure?: ApplyResult }> {
+    if (!tests.length) return { notes: ['tests_skipped: no test files in the candidate'] };
+    const runner = ['vitest', 'jest'].find(name => this.declared(name, pkg.full));
+    if (!runner) return { notes: [`tests_skipped: no vitest or jest declared in package.json of ${pkg.rel} or its parents`] };
+    const bin = this.packageBin(runner, pkg.full);
+    if (!bin) return { notes: [], failure: outcome('error', `test_runner_not_found: ${runner} is declared in package.json but no package with a bin entry resolves from ${pkg.rel}; install dependencies, then apply the same candidate again.`) };
+    const args = runner === 'vitest' ? ['run'] : ['--ci', '--runTestsByPath'];
+    const ran = await this.run(process.execPath, [bin, ...args, ...tests.map(slash)], pkg.full, TEST_ENV);
+    if (ran.code === 0) return { notes: [`tests_passed: ${runner} ran ${tests.length} test file(s)`] };
+    return { notes: [], failure: outcome('error', typeof ran.code === 'number'
+      ? `tests_failed: ${runner} failed on the candidate's tests; nothing was committed and the same candidate can be applied again, or a new one generated.`
+      : `tests_not_completed: ${runner} did not finish; nothing was committed and the candidate can be applied again.`, ...commandDiagnostics(ran)) };
   }
   /** Runs the trusted fix tools on the raw commit's paths only and commits their changes separately after a passing typecheck. */
   async postprocess(id: string, packageDir?: string): Promise<PostprocessResult> {
@@ -609,10 +659,8 @@ export class SessionStore {
     }
     const config = this.tsconfigFile(candidate.tsconfig ?? this.tsconfig), tsconfig = config.full;
     // Tools run in the package directory: ESLint flat config is looked up from the working directory, and binaries resolve from there.
-    // Default: the directory of the tsconfig the raw commit was validated with, which is the package in a monorepo.
-    const packageRel = packageDir ?? dirname(config.path);
-    const packageFull = ['.', ''].includes(packageRel) ? this.root : this.safePath(packageRel, true);
-    if (!statSync(packageFull).isDirectory()) throw new SessionError('invalid_path', 'packageDir must be a workspace directory.');
+    // Postprocess never runs tests: formatting must not change behaviour, and candidate_apply ran them on the raw candidate.
+    const pkg = this.packageDirectory(packageDir, config.path), packageRel = pkg.rel, packageFull = pkg.full;
     this.applyRunning = true;
     try {
       // Other uncommitted work may stay, as in candidate_apply: only the raw commit's files must be untouched.
@@ -634,8 +682,7 @@ export class SessionStore {
         return outcome('error', `raw_commit_mismatch: the recorded raw commit is not a commit of exactly this candidate's files; nothing was changed: ${paths.join(', ') || 'no paths'}`);
       }
       // ESLint ignores files outside its base directory, which would silently look like no_changes.
-      const toolPaths = paths.map(path => relative(packageFull, join(this.root, path)));
-      const outside = paths.filter((_, index) => toolPaths[index].startsWith('..') || isAbsolute(toolPaths[index]));
+      const { relative: toolPaths, outside } = this.inPackage(pkg, paths);
       if (outside.length) {
         return outcome('error', `outside_package_dir: ${outside.join(', ')} is not inside ${packageRel}; pass the targets' package as packageDir.`);
       }

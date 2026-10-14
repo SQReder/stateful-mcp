@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
@@ -14,23 +14,14 @@ const LINT = "s => s + '// eslint after ' + (s.includes(\"'\") ? 'prettier' : 'r
 const FLAGS = { prettier: '--write', eslint: '--fix' };
 const sha256 = (text) => createHash('sha256').update(text).digest('hex');
 
-// Fake CLI in the workspace's node_modules: checks its fix flag, rewrites the files after `--`, then exits.
-// prettier uses a string bin; eslint an object bin behind `exports`, which hides package.json from require.resolve.
-// The tool is also declared in the committed root package.json, since postprocess runs only declared tools.
+// Fake fix tool: checks its fix flag, rewrites the files after `--`, then exits. prettier uses a string bin, eslint an object bin.
 function tool(f, name, transform, { exit = 0, extra = '' } = {}) {
-  const manifest = join(f.root, 'package.json');
-  const pkg = existsSync(manifest) ? JSON.parse(readFileSync(manifest, 'utf8')) : { private: true };
-  writeFileSync(manifest, JSON.stringify({ ...pkg, devDependencies: { ...pkg.devDependencies, [name]: '*' } }));
-  f.run('add', 'package.json'); f.run('commit', '-q', '-m', `declare ${name}`);
-  const dir = join(f.root, 'node_modules', name);
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, 'package.json'), JSON.stringify(name === 'prettier' ? { name, bin: 'cli.cjs' } : { name, bin: { [name]: 'cli.cjs' }, exports: { '.': './cli.cjs' } }));
-  writeFileSync(join(dir, 'cli.cjs'), `const fs = require('node:fs');
+  f.tool(name, `const fs = require('node:fs');
 if (!process.argv.includes('${FLAGS[name]}')) process.exit(9);
 for (const file of process.argv.slice(process.argv.indexOf('--') + 1)) fs.writeFileSync(file, (${transform})(fs.readFileSync(file, 'utf8')));
 ${extra}
 process.exit(${exit});
-`);
+`, { objectBin: name !== 'prettier' });
 }
 
 // A raw commit of PASSING made by candidate_apply, with postprocess configured as given.

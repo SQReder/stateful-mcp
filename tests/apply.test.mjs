@@ -5,11 +5,14 @@ import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { fixture, PASSING, FAILING, BASE } from './git-fixture.mjs';
 
+// The fixture declares no test runner, so applying a candidate with a test file notes the skipped run.
+const NO_RUNNER = 'tests_skipped: no vitest or jest declared in package.json of . or its parents';
+
 test('approved compilable candidate is committed alone with a trailer, and a repeat neither reruns tsc nor commits', async (t) => {
   const f = await fixture(t);
   const store = f.open(), id = await f.session(store), c = await f.candidate(store, id, PASSING), before = f.head();
   const result = await store.candidateApply(id, c);
-  assert.deepEqual(result, { status: 'committed', diagnostics: [], changedFiles: ['value.test.ts'] });
+  assert.deepEqual(result, { status: 'committed', diagnostics: [NO_RUNNER], changedFiles: ['value.test.ts'] });
   const commit = f.committed(before);
   assert.deepEqual(commit.files, ['value.test.ts']);
   assert.equal(commit.blob, PASSING);
@@ -350,7 +353,7 @@ test('a feature candidate that edits a module and adds a test is one commit of e
   const { id, c, before } = await feature(f, store, { files: [{ path: 'source.ts', edits: [{ search: 'export const value = 1;', replace: DOUBLE }] }, { path: 'value.test.ts', content: DOUBLE_TEST }] },
     { objective: 'Add double helper', commitType: 'feat' });
   const result = await store.candidateApply(id, c);
-  assert.deepEqual(result, { status: 'committed', diagnostics: [], changedFiles: ['source.ts', 'value.test.ts'] });
+  assert.deepEqual(result, { status: 'committed', diagnostics: [NO_RUNNER], changedFiles: ['source.ts', 'value.test.ts'] });
   const commit = f.committed(before);
   assert.deepEqual(commit.files, ['source.ts', 'value.test.ts']);
   assert.equal(f.run('show', 'HEAD:source.ts'), DOUBLE);
@@ -398,7 +401,7 @@ test('a file left at its base is neither written nor committed, and a candidate 
   const store = f.open(), { id, c: same } = await feature(f, store, { files: [{ path: 'source.ts', content: SOURCE }] });
   assert.deepEqual(await store.candidateApply(id, same), { status: 'no_changes', diagnostics: [], changedFiles: [] });
   const c = await f.candidate(store, id, { files: [{ path: 'source.ts', content: SOURCE }, { path: 'value.test.ts', content: PASSING }] }), before = f.head();
-  assert.deepEqual(await store.candidateApply(id, c), { status: 'committed', diagnostics: [], changedFiles: ['value.test.ts'] });
+  assert.deepEqual(await store.candidateApply(id, c), { status: 'committed', diagnostics: [NO_RUNNER], changedFiles: ['value.test.ts'] });
   assert.deepEqual(f.committed(before).files, ['value.test.ts']);
   assert.deepEqual(f.dirty(), []);
 });

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -72,5 +72,17 @@ export async function fixture(t, { base = null, git = true } = {}) {
     db.prepare('UPDATE sessions SET state = ? WHERE id = ?').run(JSON.stringify({ ...state, apply }), id);
     db.close();
   };
-  return { temp, root, config, target, run, dirty, open, candidate, session, hook, unhook, head, committed, journal };
+  // Fake CLI package in node_modules running `script`, declared in the committed root package.json, since tools and runners run only when declared.
+  // A string bin, or with objectBin an object bin behind `exports`, which hides package.json from require.resolve.
+  const tool = (name, script, { objectBin = false } = {}) => {
+    const manifest = join(root, 'package.json');
+    const pkg = existsSync(manifest) ? JSON.parse(readFileSync(manifest, 'utf8')) : { private: true };
+    writeFileSync(manifest, JSON.stringify({ ...pkg, devDependencies: { ...pkg.devDependencies, [name]: '*' } }));
+    run('add', 'package.json'); run('commit', '-q', '-m', `declare ${name}`);
+    const dir = join(root, 'node_modules', name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(objectBin ? { name, bin: { [name]: 'cli.cjs' }, exports: { '.': './cli.cjs' } } : { name, bin: 'cli.cjs' }));
+    writeFileSync(join(dir, 'cli.cjs'), script);
+  };
+  return { temp, root, config, target, run, dirty, open, candidate, session, hook, unhook, head, committed, journal, tool };
 }
