@@ -1,4 +1,3 @@
-import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -39,37 +38,61 @@ const call = async (name, args) => {
   if (response.isError) throw Object.assign(new Error(name), { detail: response.structuredContent.error ?? response.structuredContent });
   return response.structuredContent;
 };
-const summary = { ok: false, transport: 'stdio', tlsVerification: true, candidates: [], usage: [] };
-try {
-  await client.connect(transport);
-  summary.model = (await call('worker_diagnostics', {})).model;
-  const { sessionId } = await call('session_start', { objective: 'Cover clamp with unit tests', allowedPaths: ['clamp.test.ts'] });
-  await call('context_set', { sessionId, files: ['clamp.ts'], brief: 'Write node:test tests (import test from "node:test", assert from "node:assert/strict") for clamp from "./clamp.js".',
-    acceptanceCriteria: ['A value inside the range is returned unchanged', 'A value below min returns min', 'A value above max returns max', 'min greater than max throws RangeError'] });
-  // Scripted reviewer: one reject with a finding, then approve the revision. This proves mechanics, not test quality.
-  for (const [message, verdict] of [['Write the tests.', 'reject'], ['Revise the tests according to the findings.', 'approve']]) {
-    const chat = await call('worker_chat', { sessionId, message });
-    summary.usage.push(chat.usage);
-    if (!chat.candidateId) throw Object.assign(new Error('no candidate'), { detail: chat.candidateDiagnostics });
-    assert.equal(chat.responsePreview, undefined);
-    assert.ok(chat.artifact.content.length > 0);
-    summary.candidates.push({ codeLength: chat.artifact.content.length, verdict });
+// A reply the server could not turn into a candidate is retried, as the role would do: its problems reach the worker automatically.
+const MAX_ATTEMPTS = 3;
+const NODE_TEST = 'Use node:test (import test from "node:test") and node:assert/strict.';
+
+const scenarios = [
+  { name: 'tests', expected: ['clamp.test.ts'],
+    start: { objective: 'Cover clamp with unit tests', allowedPaths: ['clamp.test.ts'] },
+    context: { files: ['clamp.ts'], brief: `Write tests in clamp.test.ts for clamp from "./clamp.js". ${NODE_TEST}`,
+      acceptanceCriteria: ['A value inside the range is returned unchanged', 'A value below min returns min', 'A value above max returns max', 'min greater than max throws RangeError'] } },
+  { name: 'feature', expected: ['clamp.ts', 'wrap.test.ts'],
+    start: { objective: 'Add wrap to the clamp module', allowedPaths: ['clamp.ts', 'wrap.test.ts'], commitType: 'feat' },
+    context: { files: ['clamp.ts'], brief: 'Add an exported function wrap(value: number, min: number, max: number): number to clamp.ts that wraps value into [min, max). '
+      + `Keep clamp unchanged and change clamp.ts with edits, not whole content. Write tests for wrap in the new file wrap.test.ts, importing from "./clamp.js". ${NODE_TEST}`,
+      acceptanceCriteria: ['wrap(5, 0, 10) returns 5', 'wrap(12, 0, 10) returns 2', 'wrap(-1, 0, 10) returns 9', 'min greater than or equal to max throws RangeError'] } },
+];
+
+async function run({ name, start, context, expected }) {
+  const result = { name, attempts: 0, invalidReplies: [], candidates: [], usage: [] };
+  const { sessionId } = await call('session_start', start);
+  await call('context_set', { sessionId, ...context });
+  // Scripted reviewer: one reject with a finding, then approve the revision. This proves mechanics, not code quality.
+  for (const [message, verdict] of [['Implement the acceptance criteria.', 'reject'], ['Revise according to the findings.', 'approve']]) {
+    let chat;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS && !chat?.candidateId; attempt++) {
+      result.attempts++;
+      chat = await call('worker_chat', { sessionId, message: attempt ? 'Fix exactly the problems reported for your previous reply.' : message });
+      result.usage.push(chat.usage);
+      if (!chat.candidateId) result.invalidReplies.push(chat.candidateDiagnostics.map(problem => problem.code));
+    }
+    if (!chat.candidateId) throw Object.assign(new Error(`${name}: no candidate after ${MAX_ATTEMPTS} attempts`), { detail: result.invalidReplies });
+    result.candidates.push({ verdict, files: chat.artifacts.map(({ path, content, edits }) => ({ path, bytes: content.length, edits: edits?.length ?? 0 })) });
     const findings = verdict === 'reject' ? [{ severity: 'minor', message: 'Name each test exactly after the acceptance criterion it covers.' }] : [];
     await call('candidate_review', { sessionId, candidateId: chat.candidateId, verdict, findings });
     if (verdict === 'approve') {
       const applied = await call('candidate_apply', { sessionId, candidateId: chat.candidateId });
-      summary.applyStatus = applied.status;
-      summary.applyDiagnostics = applied.diagnostics.map(text => text.slice(0, 400));
+      result.applyStatus = applied.status;
+      result.applyDiagnostics = applied.diagnostics.map(text => text.slice(0, 400));
       if (applied.status === 'committed') {
-        summary.commitFiles = git('diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD').trim().split('\n');
-        summary.commitSubject = git('log', '-1', '--format=%s');
+        result.commitFiles = git('diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD').trim().split('\n');
+        result.commitSubject = git('log', '-1', '--format=%s').trim();
         // The MCP store is untracked here on purpose: the clean check of candidate_apply skips it too.
-        summary.dirtyPaths = git('status', '--porcelain', '--untracked-files=all').split('\n').filter(line => line && !line.includes('.stateful-worker/'));
-        summary.treeClean = summary.dirtyPaths.length === 0;
-        summary.ok = summary.treeClean && summary.commitFiles.join() === 'clamp.test.ts';
+        result.dirtyPaths = git('status', '--porcelain', '--untracked-files=all').split('\n').filter(line => line && !line.includes('.stateful-worker/'));
+        result.ok = result.dirtyPaths.length === 0 && result.commitFiles.join() === expected.join();
       }
     }
   }
+  return result;
+}
+
+const summary = { ok: false, transport: 'stdio', tlsVerification: true, scenarios: [] };
+try {
+  await client.connect(transport);
+  summary.model = (await call('worker_diagnostics', {})).model;
+  for (const scenario of scenarios) summary.scenarios.push(await run(scenario));
+  summary.ok = summary.scenarios.every(scenario => scenario.ok);
 } catch (error) {
   summary.failedAt = error instanceof Error ? error.message : 'unknown';
   summary.detail = error?.detail;

@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Add the `qwen-code-supervisor` Kilo mode for features and bug fixes, and a feature scenario to `npm run smoke:e2e`.
 - Run the candidate's test files with the package's vitest or jest after the typecheck and before the raw commit; failures restore the files and stay retryable, and `candidate_apply` takes `packageDir`.
 - Apply, commit and postprocess multi-file candidates: per-file preconditions, only changed files written and committed, every TypeScript file required in the typecheck, per-file restore.
 - Accept multi-file candidates: 1-8 target files per session, exact whole-line search/replace edits or complete content per file, minimal review diffs, and parse problems with hints fed back to the worker; `commitType` (`test`, `feat`, `fix`) names the raw commit.

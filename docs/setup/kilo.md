@@ -25,8 +25,9 @@
    сборка Kilo, не проверено.
 5. Вызови `worker_instruct` с `{"message":"Reply with the single word READY."}`.
    Успех — `ok: true`, непустой `text`, `finishReason: "stop"`.
-6. Проверь загрузку `.kilocodemodes`, видимость роли `qwen-test-supervisor`
-   и разрешения `read`/`mcp` в корпоративном форке. Роль описывает будущий
+6. Проверь загрузку `.kilocodemodes`, видимость ролей `qwen-test-supervisor`
+   (тесты) и `qwen-code-supervisor` (фичи и багфиксы с тестами) и разрешения
+   `read`/`mcp` в корпоративном форке. Роль описывает будущий
    полный workflow; кандидаты и review доступны с I2, apply с проверкой
    компиляцией, raw commit и postprocess — с I3–I4.
 

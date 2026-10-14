@@ -71,7 +71,9 @@
 - [ ] Known limit: a candidate without TypeScript files skips the inclusion gate, so a `.json` change that breaks an importing `.ts` counts as an error elsewhere.
 - [x] F3: run the candidate's test files with the package's vitest/jest as part of validation (`npm test`: 90 passed with fake runners; independent review findings fixed).
 - [ ] Verify the F3 runner contract with real vitest and jest (JSON report shape, `--outputFile`, `CI=1` snapshot behaviour, jest `testMatch` with `--runTestsByPath`).
-- [ ] F4: `qwen-code-supervisor` role and a live feature E2E on `gpt-6-luna`.
+- [x] F4: `qwen-code-supervisor` role for features and bug fixes.
+- [ ] F4: run `npm run smoke:e2e` (tests and feature scenarios) on `gpt-6-luna`; on 2026-10-14 the local gateway was unreachable (`connection_error`).
+- [ ] Try the `qwen-code-supervisor` role in corporate Kilo on a real feature or bug fix (developer with corporate Kilo).
 
 ## Deployment/pilot checks
 
