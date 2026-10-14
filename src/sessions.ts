@@ -1,6 +1,7 @@
 import { execFile, execFileSync } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, openSync, fstatSync, readSync, closeSync, unlinkSync, writeFileSync, type BigIntStats } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, openSync, fstatSync, readSync, closeSync, unlinkSync, writeFileSync, type BigIntStats } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { basename, dirname, isAbsolute, join, relative, parse, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -101,6 +102,15 @@ const errorsOnlyElsewhere = (result: CommandResult, paths: string[]): boolean =>
   typeof result.code === 'number' && /error TS\d+/.test(`${result.stdout}\n${result.stderr}`) && !reportsErrorIn(result, paths);
 const outsideNote = (result: CommandResult): string[] => result.code === 0 ? []
   : [capped('typecheck_errors_outside_target: tsc reports errors only in other files; they were ignored', result.stdout || result.stderr)];
+/** File results of a jest-style JSON test report, or undefined when it is missing or unreadable; the report file is removed. */
+const readTestReport = (file: string): Array<{ name: string; status: string }> | undefined => {
+  try {
+    const report: unknown = JSON.parse(readFileSync(file, 'utf8'));
+    const entries = (report as { testResults?: unknown })?.testResults;
+    if (!Array.isArray(entries)) return undefined;
+    return entries.filter((entry): entry is { name: string; status: string } => typeof entry?.name === 'string' && typeof entry?.status === 'string');
+  } catch { return undefined; } finally { rmSync(file, { force: true }); }
+};
 /** Paths of `git status --porcelain=v1 -z` output outside the store directory. */
 const statusPaths = (stdout: string): string[] => {
   const fields = stdout.split('\0'), paths: string[] = [];
@@ -487,7 +497,10 @@ export class SessionStore {
         if (!checked) {
           failure = outcome('error', `target_not_in_typecheck: tsc --listFilesOnly -p ${config.path} does not include ${missing.join(', ')}; a typecheck without the candidate's TypeScript files is not validation. Apply again with the tsconfig of the targets' package.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed)));
         } else if (tested?.failure) {
-          failure = tested.failure; // never final: a flake or unfinished work elsewhere may cause it, so the supervisor decides
+          // Never final: a flake or unfinished work elsewhere may cause it, so the supervisor decides. Files the failed run left behind
+          // are named now: on a retry they would already be in the baseline and pass unnoticed.
+          const leftovers = (await this.changedPaths() ?? []).filter(path => !writtenPaths.some(mine => samePath(mine, path)) && !baseline.some(before => samePath(before, path)));
+          failure = leftovers.length ? { ...tested.failure, diagnostics: [...tested.failure.diagnostics, `test_left_changes: the failed test run left these changes, which were not reverted: ${leftovers.join(', ')}`] } : tested.failure;
         } else if (typechecked) {
           // Passed: the candidate files have no type errors. Errors only in other files (user decision: pre-existing or unfinished work
           // in a monorepo) are reported, not blocking. New changes besides the targets (paths not dirty before) mean validation wrote files,
@@ -496,9 +509,11 @@ export class SessionStore {
           // Only written files may change: an unchanged candidate file edited meanwhile was typechecked but would miss the commit.
           const foreign = changed.filter(path => !writtenPaths.some(mine => samePath(mine, path)) && !baseline.some(before => samePath(before, path)));
           const unseen = writtenPaths.filter(mine => !changed.some(path => samePath(mine, path)));
-          if (foreign.length || unseen.length) {
+          // A test run may rewrite a candidate file; the commit would then hold code that was neither reviewed nor checked.
+          const rewritten = written.filter(file => !this.matches(file.path, file.content)).map(file => file.path);
+          if (foreign.length || unseen.length || rewritten.length) {
             journal('error');
-            const found = status ? [...foreign, ...unseen.map(path => `${path} (shows no change)`)].join(', ') : 'Git status unavailable';
+            const found = status ? [...foreign, ...unseen.map(path => `${path} (shows no change)`), ...rewritten.map(path => `${path} (no longer the candidate's content)`)].join(', ') : 'Git status unavailable';
             return { status: 'error', diagnostics: [`unexpected_changes: validation passed but new changes besides the targets appeared or a written target shows no change; nothing was reverted: ${found}`], changedFiles: changed };
           }
           const head = await this.run('git', ['rev-parse', '--verify', 'HEAD']);
@@ -632,12 +647,28 @@ export class SessionStore {
     if (!runner) return { notes: [`tests_skipped: no vitest or jest declared in package.json of ${pkg.rel} or its parents`] };
     const bin = this.packageBin(runner, pkg.full);
     if (!bin) return { notes: [], failure: outcome('error', `test_runner_not_found: ${runner} is declared in package.json but no package with a bin entry resolves from ${pkg.rel}; install dependencies, then apply the same candidate again.`) };
-    const args = runner === 'vitest' ? ['run'] : ['--ci', '--runTestsByPath'];
+    // Both runners write a jest-style JSON report ({ testResults: [{ name, status }] }) to a file outside the workspace, so the run is
+    // judged by the candidate's own test files: vitest treats paths as substring filters and may run others, which may fail on their own.
+    const report = join(tmpdir(), `stateful-worker-tests-${randomUUID()}.json`);
+    const args = runner === 'vitest' ? ['run', '--reporter=json', `--outputFile=${report}`] : ['--ci', '--json', `--outputFile=${report}`, '--runTestsByPath'];
     const ran = await this.run(process.execPath, [bin, ...args, ...tests.map(slash)], pkg.full, TEST_ENV);
-    if (ran.code === 0) return { notes: [`tests_passed: ${runner} ran ${tests.length} test file(s)`] };
-    return { notes: [], failure: outcome('error', typeof ran.code === 'number'
-      ? `tests_failed: ${runner} failed on the candidate's tests; nothing was committed and the same candidate can be applied again, or a new one generated.`
-      : `tests_not_completed: ${runner} did not finish; nothing was committed and the candidate can be applied again.`, ...commandDiagnostics(ran)) };
+    const results = readTestReport(report);
+    const fail = (message: string): { notes: string[]; failure: ApplyResult } => ({ notes: [], failure: outcome('error',
+      `${message} Nothing was committed; the same candidate can be applied again, or a new one generated.`, ...commandDiagnostics(ran)) });
+    if (typeof ran.code !== 'number') return fail(`tests_not_completed: ${runner} did not finish.`);
+    if (!results) {
+      // Unreadable report: fall back to the exit code, which cannot tell the candidate's tests from others.
+      return ran.code === 0 ? { notes: [`tests_passed: ${runner} exited 0 (no readable report)`] } : fail(`tests_failed: ${runner} failed and its report could not be read.`);
+    }
+    const own = tests.map(test => resolve(pkg.full, test));
+    const result = (file: string): { name: string; status: string } | undefined => results.find(entry => samePath(resolve(pkg.full, entry.name), file));
+    const failed = own.filter(file => result(file)?.status === 'failed'), notRun = own.filter(file => !result(file));
+    const rel = (files: string[]): string => files.map(file => slash(relative(pkg.full, file))).join(', ');
+    if (failed.length) return fail(`tests_failed: ${runner} reports failing candidate tests: ${rel(failed)}.`);
+    if (notRun.length) return fail(`tests_not_run: ${runner} did not run ${rel(notRun)}; check the runner's include/testMatch configuration.`);
+    const others = results.filter(entry => entry.status === 'failed' && !own.some(file => samePath(resolve(pkg.full, entry.name), file)));
+    return { notes: [`tests_passed: ${runner} ran ${own.length} candidate test file(s)`,
+      ...(others.length ? [`tests_failed_elsewhere: other test files run by the filter failed and were ignored: ${others.map(entry => entry.name).join(', ')}`] : [])] };
   }
   /** Runs the trusted fix tools on the raw commit's paths only and commits their changes separately after a passing typecheck. */
   async postprocess(id: string, packageDir?: string): Promise<PostprocessResult> {

@@ -2,25 +2,32 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { fixture, PASSING, BASE } from './git-fixture.mjs';
+import { fixture, PASSING, FAILING, BASE } from './git-fixture.mjs';
 
 const SOURCE = 'export const value = 1;\n';
 const DOUBLE = 'export const value = 1;\nexport const double = (x: number): number => x * 2;\n';
 const DOUBLE_TEST = 'import { double } from "./source.js";\nconst checked: number = double(2);\nexport { checked };\n';
 const NO_RUNNER = 'tests_skipped: no vitest or jest declared in package.json of . or its parents';
 
-// Fake test runner: logs each call to runner.log outside the workspace, exits 9 on an unexpected argv prefix or env,
-// and fails with output when a given test file, read relative to its working directory, contains FAIL_ME.
+// Fake test runner: logs each call to runner.log outside the workspace and exits 9 on unexpected flags or env (8 if the API key leaked
+// under any spelling). It writes a jest-style JSON report to --outputFile: a test file containing FAIL_ME fails, one containing SKIP_ME
+// is left out of the report (not run), and an OTHER_FAILS file in the working directory adds a failing unrelated test.
 // vitest uses a string bin, jest an object bin.
 function runner(f, name, extra = '') {
-  const prefix = name === 'vitest' ? ['run'] : ['--ci', '--runTestsByPath'];
+  const flags = name === 'vitest' ? ['run', '--reporter=json'] : ['--ci', '--json', '--runTestsByPath'];
   f.tool(name, `const fs = require('node:fs'), path = require('node:path');
-const args = process.argv.slice(2), prefix = ${JSON.stringify(prefix)}, files = args.slice(prefix.length);
+const args = process.argv.slice(2), flags = ${JSON.stringify(flags)};
+const output = args.find(arg => arg.startsWith('--outputFile=')), files = args.filter(arg => !arg.startsWith('-') && arg !== 'run');
 fs.appendFileSync(${JSON.stringify(join(f.temp, 'runner.log'))}, JSON.stringify({ runner: '${name}', cwd: path.basename(process.cwd()), files }) + '\\n');
-if (process.env.CI !== '1' || process.env.FORCE_COLOR !== '0' || prefix.some((arg, index) => args[index] !== arg)) process.exit(9);
+if (Object.keys(process.env).some(key => key.toUpperCase() === 'HARNESS_MODEL_API_KEY')) process.exit(8);
+if (process.env.CI !== '1' || process.env.FORCE_COLOR !== '0' || !output || flags.some(flag => !args.includes(flag))) process.exit(9);
 ${extra}
-const failing = files.filter(file => fs.readFileSync(file, 'utf8').includes('FAIL_ME'));
-if (failing.length) { console.log('FAIL ' + failing.join(' ')); process.exit(1); }
+const results = files.filter(file => !fs.readFileSync(file, 'utf8').includes('SKIP_ME'))
+  .map(file => ({ name: path.resolve(file), status: fs.readFileSync(file, 'utf8').includes('FAIL_ME') ? 'failed' : 'passed' }));
+if (fs.existsSync('OTHER_FAILS')) results.push({ name: path.resolve('other-value.test.ts'), status: 'failed' });
+fs.writeFileSync(output.slice('--outputFile='.length), JSON.stringify({ testResults: results }));
+const failing = results.filter(result => result.status === 'failed');
+if (failing.length) { console.log('FAIL ' + failing.map(result => path.basename(result.name)).join(' ')); process.exit(1); }
 `, { objectBin: name === 'jest' });
 }
 const calls = (f) => {
@@ -37,7 +44,7 @@ test('passing tests run every test file of the candidate, changed or not, with v
   runner(f, 'vitest');
   const store = f.open(), { id, c, before } = await feature(f, store, [{ path: 'value.test.ts', content: BASE }, { path: 'other.spec.ts', content: PASSING }]);
   const result = await store.candidateApply(id, c);
-  assert.deepEqual(result, { status: 'committed', diagnostics: ['tests_passed: vitest ran 2 test file(s)'], changedFiles: ['other.spec.ts'] });
+  assert.deepEqual(result, { status: 'committed', diagnostics: ['tests_passed: vitest ran 2 candidate test file(s)'], changedFiles: ['other.spec.ts'] });
   assert.deepEqual(f.committed(before).files, ['other.spec.ts']);
   assert.deepEqual(calls(f).map(call => ({ ...call, files: call.files.sort() })), [{ runner: 'vitest', cwd: 'workspace', files: ['other.spec.ts', 'value.test.ts'] }]);
   assert.deepEqual(f.dirty(), []);
@@ -130,11 +137,51 @@ test('in a monorepo jest declared only at the root runs from the package with pa
   await assert.rejects(store.candidateApply(id, c, undefined, '../outside'), { code: 'invalid_path' });
   const result = await store.candidateApply(id, c);
   assert.equal(result.status, 'committed', result.diagnostics.join('\n'));
-  assert.deepEqual(result.diagnostics, ['tests_passed: jest ran 1 test file(s)']);
+  assert.deepEqual(result.diagnostics, ['tests_passed: jest ran 1 candidate test file(s)']);
   assert.deepEqual(calls(f), [{ runner: 'jest', cwd: 'a', files: ['value.test.ts'] }]);
   assert.equal(f.run('rev-parse', 'HEAD^').trim(), before);
   assert.equal(f.run('show', 'HEAD:packages/a/value.test.ts'), PASSING); // committed() reads the root target
   assert.deepEqual(f.dirty(), []);
+});
+
+test('the run is judged by the candidate tests: other failures are noted, unrun candidate tests and rewritten candidate files stop the commit', async (t) => {
+  const f = await fixture(t);
+  runner(f, 'vitest');
+  writeFileSync(join(f.root, 'OTHER_FAILS'), ''); // an unrelated test matched by the substring filter fails
+  f.run('add', 'OTHER_FAILS'); f.run('commit', '-q', '-m', 'unrelated failing test');
+  const store = f.open(), id = await f.session(store), c = await f.candidate(store, id, PASSING);
+  const passed = await store.candidateApply(id, c);
+  assert.equal(passed.status, 'committed', passed.diagnostics.join('\n'));
+  assert.deepEqual(passed.diagnostics, ['tests_passed: vitest ran 1 candidate test file(s)', `tests_failed_elsewhere: other test files run by the filter failed and were ignored: ${join(f.root, 'other-value.test.ts')}`]);
+
+  const g = await fixture(t);
+  runner(g, 'vitest');
+  const other = g.open(), otherId = await g.session(other), skipped = await g.candidate(other, otherId, `${PASSING}// SKIP_ME\n`), start = g.head();
+  const notRun = await other.candidateApply(otherId, skipped);
+  assert.equal(notRun.status, 'error');
+  assert.match(notRun.diagnostics.join('\n'), /tests_not_run: vitest did not run value\.test\.ts/);
+  assert.equal(g.head(), start);
+  assert.equal(existsSync(g.target), false);
+
+  const h = await fixture(t);
+  runner(h, 'vitest', "fs.writeFileSync(files[0], 'export const rewritten = 1;\\n');");
+  const third = h.open(), thirdId = await h.session(third), d = await h.candidate(third, thirdId, PASSING), base = h.head();
+  const rewritten = await third.candidateApply(thirdId, d);
+  assert.equal(rewritten.status, 'error');
+  assert.match(rewritten.diagnostics.join('\n'), /unexpected_changes.*value\.test\.ts \(no longer the candidate's content\)/);
+  assert.equal(h.head(), base);
+});
+
+test('a failing typecheck never starts the runner, and the runner never sees the API key under any spelling', async (t) => {
+  const f = await fixture(t);
+  runner(f, 'vitest');
+  const store = f.open(), id = await f.session(store);
+  assert.equal((await store.candidateApply(id, await f.candidate(store, id, FAILING))).status, 'validation_failed');
+  assert.deepEqual(calls(f), []);
+  process.env.harness_model_api_key = 'must-not-leak';
+  t.after(() => { delete process.env.harness_model_api_key; });
+  const c = await f.candidate(store, id, PASSING);
+  assert.equal((await store.candidateApply(id, c)).status, 'committed'); // the fake exits 8 if it sees the key
 });
 
 test('a test file whose package-relative path starts with "-" is refused before any write, since a runner would read it as an option', async (t) => {

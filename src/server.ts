@@ -31,7 +31,7 @@ server.registerTool('worker_diagnostics', {
 }, () => {
   try {
     const config = readConfig();
-    return result({ configured: true, model: config.model, timeoutMs: config.timeoutMs, stage: 'F2',
+    return result({ configured: true, model: config.model, timeoutMs: config.timeoutMs, stage: 'F3',
       ...('root' in workspace ? { workspaceRoot: workspace.root } : { workspaceError: workspace.error }) });
   } catch (error: unknown) {
     if (!(error instanceof ConfigurationError)) throw error;
@@ -112,8 +112,9 @@ server.registerTool('candidate_apply', {
     + 'tsconfig: workspace-relative .json of the targets\' package (needed in monorepos); default WORKER_TSCONFIG. It must include every TypeScript file of the candidate, otherwise error target_not_in_typecheck, which can be retried with another tsconfig. '
     + 'After a passing typecheck runs every test file of the candidate (*.test.* / *.spec.*, JS or TS) with the package\'s runner, without a shell, from packageDir with CI=1: vitest run if declared in package.json of packageDir or a parent, else jest --ci --runTestsByPath. '
     + 'packageDir: workspace-relative directory of the tests\' package; default: the directory of the tsconfig. Test files outside it give error outside_package_dir before anything is written. '
-    + 'Diagnostics note tests_passed, or tests_skipped when the candidate has no test files or no runner is declared. Error tests_failed (runner output included), tests_not_completed (timeout or kill) or test_runner_not_found (declared, not installed) restores the files and is not final: the same candidate may be applied again or a new one generated. '
-    + 'Files the test run writes (snapshots, coverage) give error unexpected_changes; nothing is reverted. '
+    + 'The run is judged from the runner\'s JSON report for the candidate\'s own test files: diagnostics note tests_passed (plus tests_failed_elsewhere when other tests matched by the filter failed), or tests_skipped when the candidate has no test files or no runner is declared. '
+    + 'Error tests_failed (candidate tests failed, runner output included), tests_not_run (the runner did not run a candidate test; check include/testMatch), tests_not_completed (timeout or kill) or test_runner_not_found (declared, not installed) restores the files and is not final: the same candidate may be applied again or a new one generated. '
+    + 'Files the test run writes (snapshots, coverage) or candidate files it rewrites give error unexpected_changes; nothing is reverted. '
     + 'On success stages only the candidate files and creates one local commit "<commitType>: <objective>" with Git hooks enabled (no push). '
     + 'Returns status committed (hooksModified: true plus a candidate->committed diff when hooks changed files and they passed the typecheck again), validation_failed (diagnostics, files restored), conflict (dirty or changed targets, changed snapshots or external edits; nothing overwritten), no_changes or error. '
     + 'Error commit_failed (e.g. a hook refused) restores the files and may be retried; commit_scope_violation and hooks_broke_typecheck keep the commit and are final. '
