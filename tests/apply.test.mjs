@@ -172,19 +172,27 @@ test('unstaged and untracked work elsewhere stays out of the commit, while a dir
   assert.deepEqual(f.dirty().sort(), [' M tsconfig.src.json', '?? notes.txt']);
 });
 
-test('tsc errors only outside the target, e.g. in unfinished work, do not burn the candidate', async (t) => {
+test('tsc errors only in other files are reported but do not block the commit; errors in the target still fail it', async (t) => {
   const f = await fixture(t, { base: BASE });
+  // Pre-existing errors elsewhere in the repository, as in a large monorepo.
+  writeFileSync(join(f.root, 'legacy.ts'), 'export const legacy: string = 1;\n');
+  f.run('add', 'legacy.ts'); f.run('commit', '-q', '-m', 'legacy with a type error');
   const store = f.open(), id = await f.session(store);
-  const c = await f.candidate(store, id, PASSING), before = f.head();
-  writeFileSync(join(f.root, 'wip.ts'), 'export const unfinished: string = 1;\n'); // included by tsconfig.json
-  const elsewhere = await store.candidateApply(id, c);
-  assert.equal(elsewhere.status, 'error');
-  assert.match(elsewhere.diagnostics.join('\n'), /typecheck_failed_elsewhere[\s\S]*wip\.ts/);
-  assert.equal(readFileSync(f.target, 'utf8'), BASE);
-  assert.equal(f.head(), before);
-  assert.equal(store.status(id).details.candidates[0].applyResult, undefined);
-  rmSync(join(f.root, 'wip.ts'));
-  assert.equal((await store.candidateApply(id, c)).status, 'committed');
+  const good = await f.candidate(store, id, PASSING), before = f.head();
+  const passed = await store.candidateApply(id, good);
+  assert.equal(passed.status, 'committed', passed.diagnostics.join('\n'));
+  assert.match(passed.diagnostics.join('\n'), /typecheck_errors_outside_target[\s\S]*legacy\.ts/);
+  assert.deepEqual(f.committed(before).files, ['value.test.ts']);
+
+  const g = await fixture(t, { base: BASE });
+  writeFileSync(join(g.root, 'legacy.ts'), 'export const legacy: string = 1;\n');
+  g.run('add', 'legacy.ts'); g.run('commit', '-q', '-m', 'legacy with a type error');
+  const other = g.open(), otherId = await g.session(other);
+  const bad = await g.candidate(other, otherId, FAILING);
+  const failed = await other.candidateApply(otherId, bad);
+  assert.equal(failed.status, 'validation_failed');
+  assert.match(failed.diagnostics.join('\n'), /value\.test\.ts\(\d+,\d+\): error TS2322/);
+  assert.equal(readFileSync(g.target, 'utf8'), BASE);
 });
 
 test('uncommitted files in the typechecked program are reported on success and never burn the candidate on failure', async (t) => {

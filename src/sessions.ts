@@ -71,6 +71,15 @@ const samePath = (first: string, second: string): boolean => process.platform ==
  */
 const reportsErrorIn = (result: CommandResult, paths: string[]): boolean => `${result.stdout}\n${result.stderr}`.replaceAll('\\', '/').split(/\r?\n/)
   .some(line => paths.some(path => line[path.length] === '(' && samePath(line.slice(0, path.length), path)));
+/**
+ * The given files typecheck although others in the program do not (pre-existing errors in a monorepo, unfinished work): tsc finished
+ * with real `error TS…` diagnostics and none in `paths`. A failure without diagnostics, such as a crash, never counts as a pass.
+ * Assumption: a test file's own errors are reported in the test file, not through global augmentations elsewhere.
+ */
+const errorsOnlyElsewhere = (result: CommandResult, paths: string[]): boolean =>
+  typeof result.code === 'number' && /error TS\d+/.test(`${result.stdout}\n${result.stderr}`) && !reportsErrorIn(result, paths);
+const outsideNote = (result: CommandResult): string[] => result.code === 0 ? []
+  : [capped('typecheck_errors_outside_target: tsc reports errors only in other files; they were ignored', result.stdout || result.stderr)];
 /** Paths of `git status --porcelain=v1 -z` output outside the store directory. */
 const statusPaths = (stdout: string): string[] => {
   const fields = stdout.split('\0'), paths: string[] = [];
@@ -347,10 +356,9 @@ export class SessionStore {
       return { status: 'error', diagnostics: ['committed_unverified: hooks changed or removed committed files and the worktree differs from HEAD, so the commit was not typechecked; nothing was reverted.', diff, ...leftDiagnostics], changedFiles: paths };
     }
     const { listed, checked } = await this.typecheck(tsc, tsconfig, full);
-    if (checked?.code === 0) return { status: 'committed', diagnostics: [diff], changedFiles: paths, hooksModified: true };
     // Errors only in other files are not the hooks' doing: the committed files themselves still typecheck.
-    if (checked && typeof checked.code === 'number' && !reportsErrorIn(checked, paths)) {
-      return { status: 'committed', diagnostics: [diff, capped('typecheck_errors_outside_commit: other files fail the typecheck, the committed files do not', checked.stdout)], changedFiles: paths, hooksModified: true };
+    if (checked && (checked.code === 0 || errorsOnlyElsewhere(checked, paths))) {
+      return { status: 'committed', diagnostics: [diff, ...outsideNote(checked)], changedFiles: paths, hooksModified: true };
     }
     return { status: 'error', diagnostics: ['hooks_broke_typecheck: the hook-modified commit fails the typecheck; it stays in history and nothing was reverted.', ...commandDiagnostics(checked ?? listed), diff], changedFiles: paths };
   }
@@ -424,8 +432,9 @@ export class SessionStore {
         let failure: ApplyResult, final = false;
         if (!checked) {
           failure = outcome('error', `target_not_in_typecheck: tsc --listFilesOnly -p ${config.path} does not include ${candidate.path}; a typecheck without the target is not validation. Apply again with the tsconfig of the target's package.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed)));
-        } else if (checked.code === 0) {
-          // New changes besides the target (paths not dirty before the apply) mean validation wrote files.
+        } else if (checked.code === 0 || errorsOnlyElsewhere(checked, [candidate.path])) {
+          // Passed: the target has no type errors. Errors only in other files (user decision: pre-existing or unfinished work in
+          // a monorepo) are reported, not blocking. New changes besides the target (paths not dirty before) mean validation wrote files.
           const changed = await this.changedPaths() ?? [];
           const foreign = changed.filter(path => !samePath(path, candidate.path) && !baseline.some(before => samePath(before, path)));
           if (foreign.length || !changed.some(path => samePath(path, candidate.path))) {
@@ -455,7 +464,7 @@ export class SessionStore {
               const judged = await this.committedResult(committingHead, created, [candidate], baseline, tsc, tsconfig, full);
               if (judged.status === 'committed') candidate.rawCommit = created;
               const prefix = moved ? ['commit_exit_nonzero: git reported a failure after creating the commit; the commit was kept.', ...commandDiagnostics(commit)] : [];
-              candidate.applyResult = { ...judged, diagnostics: [...prefix, ...judged.diagnostics, ...uncommittedNote] };
+              candidate.applyResult = { ...judged, diagnostics: [...prefix, ...judged.diagnostics, ...uncommittedNote, ...outsideNote(checked)] };
               journal(candidate.applyResult.status === 'committed' ? 'committed' : 'error');
               return candidate.applyResult;
             }
@@ -465,14 +474,13 @@ export class SessionStore {
               : outcome('conflict', `index_not_clean: ${sneaked.join(', ')} was staged during the apply and would have joined the commit; it stays staged, the target was unstaged, and the candidate can be applied again.`, ...unstageNotes);
           }
         } else {
-          // Only real tsc errors in the target judge the candidate. A timeout, kill or errors only in other (maybe unfinished) files
-          // must not burn an approved candidate.
+          // Only real tsc errors in the target judge the candidate. A timeout, kill or failure without diagnostics must not burn it.
           const completed = typeof checked.code === 'number', inTarget = completed && reportsErrorIn(checked, [candidate.path]);
           // Errors in the target are the candidate's fault only when no uncommitted file in the program could cause them.
           final = inTarget && !uncommitted.length;
           failure = final ? outcome('validation_failed', ...commandDiagnostics(checked))
             : inTarget ? outcome('error', `typecheck_failed_with_uncommitted: tsc reports errors in the target while the program includes uncommitted files that may cause them (${uncommitted.join(', ')}); finish or commit that work, then apply the same candidate again.`, ...commandDiagnostics(checked))
-            : completed ? outcome('error', 'typecheck_failed_elsewhere: tsc reports errors only outside the target, e.g. in uncommitted work; fix them and apply the same candidate again.', ...commandDiagnostics(checked))
+            : completed ? outcome('error', 'typecheck_unrecognized: tsc failed without error diagnostics (e.g. it crashed), so the target cannot be judged; the candidate can be applied again.', ...commandDiagnostics(checked))
             : outcome('error', 'typecheck_not_completed: tsc did not finish; the candidate can be applied again.', ...commandDiagnostics(checked));
         }
         const restored = this.restore(candidate) === 'restored';
@@ -625,7 +633,8 @@ export class SessionStore {
         if (!failure) {
           const full = this.safePath(candidate.path, false), { listed, checked } = await this.typecheck(tsc, tsconfig, full);
           const uncommitted = this.dirtyInProgram(listed, baseline, touched); // as in candidateApply
-          if (checked?.code === 0) {
+          // As in candidateApply: errors only in other files are reported, not blocking.
+          if (checked && (checked.code === 0 || errorsOnlyElsewhere(checked, touched))) {
             journal('postprocess_committing', formatted);
             const added = await this.run('git', ['--literal-pathspecs', 'add', '--', ...touched]);
             // As in candidateApply: anything staged while tsc ran would ride along, so the index is checked again right before the commit.
@@ -639,7 +648,7 @@ export class SessionStore {
               const judged = await this.committedResult(raw, created, after, baseline, tsc, tsconfig, full);
               const prefix = moved ? ['commit_exit_nonzero: git reported a failure after creating the commit; the commit was kept.', ...commandDiagnostics(commit)] : [];
               const uncommittedNote = uncommitted.length ? [`validated_with_uncommitted: the typecheck included uncommitted files: ${uncommitted.join(', ')}`] : [];
-              return final({ ...judged, diagnostics: [...prefix, ...judged.diagnostics, ...notes, ...uncommittedNote] }, judged.status === 'committed' ? 'postprocessed' : 'error');
+              return final({ ...judged, diagnostics: [...prefix, ...judged.diagnostics, ...notes, ...uncommittedNote, ...outsideNote(checked)] }, judged.status === 'committed' ? 'postprocessed' : 'error');
             }
             const unstaged = await this.run('git', ['--literal-pathspecs', 'restore', '--staged', '--', ...touched]);
             const unstageNotes = unstaged.code === 0 ? [] : [`unstage_failed: ${touched.join(', ')} may still be staged.`, ...commandDiagnostics(unstaged)];
@@ -653,7 +662,7 @@ export class SessionStore {
             completed = inTouched && !uncommitted.length;
             failure = [completed ? 'postprocess_broke_typecheck: the formatted files fail the typecheck; nothing was committed and the raw commit stays.'
               : inTouched ? `typecheck_failed_with_uncommitted: the formatted files fail the typecheck while the program includes uncommitted files that may cause it (${uncommitted.join(', ')}); finish or commit that work and run postprocess again.`
-              : typeof checked.code === 'number' ? 'typecheck_failed_elsewhere: tsc reports errors only outside the formatted files, e.g. in uncommitted work; fix them and run postprocess again.'
+              : typeof checked.code === 'number' ? 'typecheck_unrecognized: tsc failed without error diagnostics (e.g. it crashed); postprocess can run again.'
               : 'typecheck_not_completed: tsc did not finish; postprocess can run again.', ...commandDiagnostics(checked)];
           }
         }
