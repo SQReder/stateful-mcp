@@ -13,7 +13,7 @@ test('approved compilable candidate is committed alone with a trailer, and a rep
   const commit = f.committed(before);
   assert.deepEqual(commit.files, ['value.test.ts']);
   assert.equal(commit.blob, PASSING);
-  assert.equal(commit.message.trim(), `test: add value.test.ts\n\nStateful-Worker-Candidate: ${c}`);
+  assert.equal(commit.message.trim(), `test: Add tests\n\nStateful-Worker-Candidate: ${c}`);
   assert.deepEqual(f.dirty(), []);
   assert.equal(store.status(id).phase, 'committed');
   const after = f.head();
@@ -24,11 +24,19 @@ test('approved compilable candidate is committed alone with a trailer, and a rep
   assert.equal(readFileSync(f.target, 'utf8'), PASSING);
 });
 
+test('the raw commit subject is the session commitType and the first line of the objective, trimmed to 72 characters', async (t) => {
+  const f = await fixture(t);
+  const store = f.open(), id = await f.session(store, { objective: `  Cover ${'x'.repeat(100)}\nDetails on the next line` });
+  const c = await f.candidate(store, id, PASSING), before = f.head();
+  assert.equal((await store.candidateApply(id, c)).status, 'committed');
+  assert.equal(f.committed(before).message.split('\n')[0], `test: Cover ${'x'.repeat(66)}`);
+});
+
 test('the session commitType names the raw commit subject', async (t) => {
   const f = await fixture(t, { base: BASE });
   const store = f.open(), id = await f.session(store, { commitType: 'fix' }), c = await f.candidate(store, id, PASSING), before = f.head();
   assert.equal((await store.candidateApply(id, c)).status, 'committed');
-  assert.equal(f.committed(before).message.trim(), `fix: update value.test.ts\n\nStateful-Worker-Candidate: ${c}`);
+  assert.equal(f.committed(before).message.trim(), `fix: Add tests\n\nStateful-Worker-Candidate: ${c}`);
 });
 
 test('hooks that reformat the target commit with a diff, but a hook that breaks the typecheck keeps the commit as an error', async (t) => {
@@ -40,7 +48,7 @@ test('hooks that reformat the target commit with a diff, but a hook that breaks 
     assert.equal(result.status, status, result.diagnostics.join('\n'));
     const commit = f.committed(before);
     assert.equal(commit.blob, `${PASSING}${line}\n`);
-    assert.match(commit.message, /^test: update value\.test\.ts/);
+    assert.match(commit.message, /^test: Add tests\n/);
     assert.deepEqual(f.dirty(), []);
     if (status === 'committed') {
       assert.equal(result.hooksModified, true);
@@ -304,5 +312,160 @@ test('crash after the write restores the base on restart, but externally changed
     const status = store.status(id);
     assert.equal(status.phase, written === PASSING ? 'restored' : 'conflict');
     assert.equal(status.details.errors.at(-1).code, 'apply_interrupted');
+  }
+});
+
+// Multi-file candidates: a feature in the existing source.ts with a new test in value.test.ts.
+const SOURCE = 'export const value = 1;\n';
+const DOUBLE = 'export const value = 1;\nexport const double = (x: number): number => x * 2;\n';
+const DOUBLE_TEST = 'import { double } from "./source.js";\nconst checked: number = double(2);\nexport { checked };\n';
+const FEATURE = { files: [{ path: 'source.ts', content: DOUBLE }, { path: 'value.test.ts', content: DOUBLE_TEST }] };
+const source = (f) => readFileSync(join(f.root, 'source.ts'), 'utf8');
+async function feature(f, store, reply = FEATURE, extra = {}) {
+  const id = await f.session(store, { allowedPaths: ['source.ts', 'value.test.ts'], ...extra });
+  return { id, c: await f.candidate(store, id, reply), before: f.head() };
+}
+
+test('a feature candidate that edits a module and adds a test is one commit of exactly both files under the objective subject', async (t) => {
+  const f = await fixture(t);
+  const store = f.open();
+  const { id, c, before } = await feature(f, store, { files: [{ path: 'source.ts', edits: [{ search: 'export const value = 1;', replace: DOUBLE }] }, { path: 'value.test.ts', content: DOUBLE_TEST }] },
+    { objective: 'Add double helper', commitType: 'feat' });
+  const result = await store.candidateApply(id, c);
+  assert.deepEqual(result, { status: 'committed', diagnostics: [], changedFiles: ['source.ts', 'value.test.ts'] });
+  const commit = f.committed(before);
+  assert.deepEqual(commit.files, ['source.ts', 'value.test.ts']);
+  assert.equal(f.run('show', 'HEAD:source.ts'), DOUBLE);
+  assert.equal(commit.blob, DOUBLE_TEST);
+  assert.equal(commit.message.trim(), `feat: Add double helper\n\nStateful-Worker-Candidate: ${c}`);
+  assert.deepEqual(f.dirty(), []);
+  assert.deepEqual(store.status(id).details.candidates[0].applyResult.changedFiles, ['source.ts', 'value.test.ts']);
+});
+
+test('one file breaking the typecheck restores every file of the candidate, deletes the new one and commits nothing', async (t) => {
+  const f = await fixture(t);
+  const store = f.open();
+  const { id, c, before } = await feature(f, store, { files: [{ path: 'source.ts', content: DOUBLE }, { path: 'value.test.ts', content: DOUBLE_TEST.replace('checked: number', 'checked: string') }] });
+  const result = await store.candidateApply(id, c);
+  assert.equal(result.status, 'validation_failed');
+  assert.match(result.diagnostics.join('\n'), /value\.test\.ts\(\d+,\d+\): error TS2322/);
+  assert.equal(f.head(), before);
+  assert.equal(source(f), SOURCE);
+  assert.equal(existsSync(f.target), false);
+  assert.deepEqual(f.dirty(), []);
+  assert.equal(store.status(id).phase, 'restored');
+});
+
+test('a dirty or externally changed second target is a conflict naming only it, and nothing is written', async (t) => {
+  const f = await fixture(t, { base: BASE });
+  const store = f.open(), { id, c } = await feature(f, store), draft = 'export const draft = 1;\n';
+  writeFileSync(f.target, draft);
+  const dirty = await store.candidateApply(id, c);
+  assert.equal(dirty.status, 'conflict');
+  assert.match(dirty.diagnostics.join('\n'), /target_dirty.*value\.test\.ts/);
+  assert.doesNotMatch(dirty.diagnostics.join('\n'), /source\.ts/);
+  assert.equal(source(f), SOURCE);
+  f.run('commit', '-q', '-am', 'external target edit');
+  const changed = await store.candidateApply(id, c);
+  assert.equal(changed.status, 'conflict');
+  assert.match(changed.diagnostics.join('\n'), /target_changed.*value\.test\.ts/);
+  assert.doesNotMatch(changed.diagnostics.join('\n'), /source\.ts/);
+  assert.equal(source(f), SOURCE);
+  assert.equal(readFileSync(f.target, 'utf8'), draft);
+  assert.deepEqual(f.dirty(), []);
+});
+
+test('a file left at its base is neither written nor committed, and a candidate of only such files is no_changes', async (t) => {
+  const f = await fixture(t);
+  const store = f.open(), { id, c: same } = await feature(f, store, { files: [{ path: 'source.ts', content: SOURCE }] });
+  assert.deepEqual(await store.candidateApply(id, same), { status: 'no_changes', diagnostics: [], changedFiles: [] });
+  const c = await f.candidate(store, id, { files: [{ path: 'source.ts', content: SOURCE }, { path: 'value.test.ts', content: PASSING }] }), before = f.head();
+  assert.deepEqual(await store.candidateApply(id, c), { status: 'committed', diagnostics: [], changedFiles: ['value.test.ts'] });
+  assert.deepEqual(f.committed(before).files, ['value.test.ts']);
+  assert.deepEqual(f.dirty(), []);
+});
+
+test('a non-TypeScript file is committed without the inclusion gate, while a TypeScript file outside the program is named', async (t) => {
+  const f = await fixture(t);
+  const store = f.open(), data = '{ "value": 1 }\n';
+  const { id, c, before } = await feature(f, store, { files: [{ path: 'data.json', content: data }, { path: 'value.test.ts', content: PASSING }] }, { allowedPaths: ['data.json', 'value.test.ts'] });
+  const result = await store.candidateApply(id, c);
+  assert.equal(result.status, 'committed', result.diagnostics.join('\n'));
+  assert.deepEqual(f.committed(before).files, ['data.json', 'value.test.ts']);
+  assert.equal(f.run('show', 'HEAD:data.json'), data);
+
+  const g = await fixture(t);
+  const other = g.open('tsconfig.src.json'), { id: otherId, c: d } = await feature(g, other);
+  const missing = await other.candidateApply(otherId, d);
+  assert.equal(missing.status, 'error');
+  assert.match(missing.diagnostics.join('\n'), /target_not_in_typecheck: .* does not include value\.test\.ts;/);
+  assert.equal(source(g), SOURCE);
+  assert.equal(existsSync(g.target), false);
+  assert.deepEqual(g.dirty(), []);
+});
+
+test('hooks that add a third file or drop a candidate file from a multi-file commit are scope violations, and the commit stays', async (t) => {
+  for (const [hook, files] of [['echo extra > extra.txt && git add extra.txt', ['extra.txt', 'source.ts', 'value.test.ts']], ['git rm -q --cached value.test.ts', ['source.ts']]]) {
+    const f = await fixture(t);
+    f.hook(hook);
+    const store = f.open(), { id, c, before } = await feature(f, store);
+    const result = await store.candidateApply(id, c);
+    assert.equal(result.status, 'error', hook);
+    assert.match(result.diagnostics.join('\n'), /commit_scope_violation/, hook);
+    assert.equal(f.run('rev-parse', 'HEAD^').trim(), before, hook);
+    assert.deepEqual(f.run('diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD').trim().split('\n'), files, hook); // committed() would read the dropped file
+    assert.deepEqual(await store.candidateApply(id, c), result, hook);
+  }
+});
+
+test('a refused multi-file commit unstages and restores every file, and the candidate can be applied again', async (t) => {
+  const f = await fixture(t);
+  f.hook('echo rejected by hook >&2; exit 1');
+  const store = f.open(), { id, c, before } = await feature(f, store);
+  const result = await store.candidateApply(id, c);
+  assert.match(result.diagnostics.join('\n'), /commit_failed[\s\S]*rejected by hook/);
+  assert.equal(f.head(), before);
+  assert.equal(source(f), SOURCE);
+  assert.equal(existsSync(f.target), false);
+  assert.deepEqual(f.dirty(), []);
+  f.unhook();
+  assert.equal((await store.candidateApply(id, c)).status, 'committed');
+  assert.deepEqual(f.committed(before).files, ['source.ts', 'value.test.ts']);
+});
+
+test('crash while committing a multi-file candidate keeps its exact trailer commit, and without a commit unstages and restores every file', async (t) => {
+  // [name, paths of the trailer commit (null: staged, no commit), expected phase, stored status]
+  for (const [name, paths, phase, stored] of [
+    ['own commit of both files', ['source.ts', 'value.test.ts'], 'committed', 'committed'],
+    ['own commit missing a file', ['value.test.ts'], 'error', 'error'],
+    ['staged, no commit', null, 'restored', undefined],
+  ]) {
+    const f = await fixture(t);
+    let store = f.open();
+    const { id, c, before } = await feature(f, store);
+    store.close();
+    writeFileSync(join(f.root, 'source.ts'), DOUBLE);
+    writeFileSync(f.target, DOUBLE_TEST);
+    f.run('add', '--', 'source.ts', 'value.test.ts');
+    if (paths) f.run('commit', '-q', '-m', 'feat: interrupted', '-m', `Stateful-Worker-Candidate: ${c}`, '--', ...paths);
+    const after = f.head();
+    f.journal(id, { candidateId: c, phase: 'committing', head: before });
+    store = f.open();
+    const status = store.status(id), applyResult = status.details.candidates[0].applyResult;
+    assert.equal(status.phase, phase, name);
+    assert.equal(status.details.errors.at(-1).code, 'apply_interrupted', name);
+    assert.equal(applyResult?.status, stored, name);
+    assert.equal(f.head(), after, name);
+    if (phase === 'committed') {
+      assert.deepEqual(applyResult.changedFiles, ['source.ts', 'value.test.ts'], name);
+      assert.deepEqual(f.dirty(), [], name);
+    } else if (phase === 'error') {
+      assert.match(applyResult.diagnostics.join('\n'), /committed_unverified.*value\.test\.ts/, name);
+      assert.equal(source(f), DOUBLE, name); // HEAD moved: files are never restored
+    } else {
+      assert.equal(source(f), SOURCE, name);
+      assert.equal(existsSync(f.target), false, name);
+      assert.deepEqual(f.dirty(), [], name);
+    }
   }
 });

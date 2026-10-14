@@ -329,9 +329,9 @@ test('a multi-file candidate edits an existing target and creates a new one, wit
   assert.equal(details.commitType, 'feat');
   assert.equal(details.candidates[0].files[0].base.content, LINES);
   assert.equal(details.candidates[0].files[1].base, null);
-  // F1 never writes: applying a multi-file candidate is refused before anything is touched.
+  // Multi-file apply (tests/apply.test.mjs) is no longer refused for its shape; here it stops at the missing tsconfig before any write.
   store.candidateReview(id, result.candidateId, 'approve', []);
-  await assert.rejects(store.candidateApply(id, result.candidateId), { code: 'multi_file_apply_unsupported' });
+  await assert.rejects(store.candidateApply(id, result.candidateId), { code: 'configuration_error' });
   assert.equal(readFileSync(join(f.root, 'calc.ts'), 'utf8'), LINES);
   assert.equal(existsSync(join(f.root, 'calc.test.ts')), false);
 });

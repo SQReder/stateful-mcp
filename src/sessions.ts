@@ -65,11 +65,11 @@ const capped = (label: string, text: string): string => text.length <= DIAGNOSTI
   : `${label} (truncated to first ${DIAGNOSTIC_LIMIT} of ${text.length} chars): ${text.slice(0, DIAGNOSTIC_LIMIT)}`;
 const commandDiagnostics = (result: CommandResult): string[] => [`exit code: ${result.code}`, capped('stdout', result.stdout), capped('stderr', result.stderr)];
 const slash = (path: string): string => path.replaceAll('\\', '/');
-/** F1 writes single-file candidates only; F2 lifts this. */
-const single = (candidate: Candidate): CandidateFile => {
-  if (candidate.files.length !== 1) throw new SessionError('multi_file_apply_unsupported', 'Applying a candidate with several files is not supported yet; nothing was written.');
-  return candidate.files[0];
-};
+/** The files apply writes and commits: a file whose content equals its base cannot change, so it is left out altogether. */
+const changes = (candidate: Candidate): CandidateFile[] => candidate.files.filter(file => file.content !== (file.base?.content ?? null));
+// Files the typecheck must include; others, such as .json, are written and committed without being part of the program.
+const TYPESCRIPT = /\.(?:ts|tsx|mts|cts)$/i;
+const MAX_SUBJECT_OBJECTIVE = 72;
 /** Sessions stored before multi-file candidates: the commit type defaults to test and a single-file candidate moves into `files`. */
 const upgrade = (state: Session): Session => {
   state.commitType ??= 'test';
@@ -140,9 +140,9 @@ export class SessionStore {
           this.recordError(state, new SessionError('postprocess_interrupted', `Previous postprocess was interrupted; ${outcomes[apply.phase as keyof typeof outcomes]}.`));
           continue;
         }
-        apply.phase = apply.phase === 'committing' ? this.recoverCommit(candidate, apply.head ?? '') : this.restore(candidate.files[0]);
+        apply.phase = apply.phase === 'committing' ? this.recoverCommit(candidate, apply.head ?? '') : this.restoreAll(changes(candidate)).length ? 'conflict' : 'restored';
         const outcomes = { committed: 'its commit exists and was kept', error: 'its commit exists but differs from the candidate; it was kept unverified',
-          restored: 'target is at its base', conflict: 'the target changed externally, HEAD moved to an unrecognised commit or Git failed, so files were left untouched' };
+          restored: 'targets are at their bases', conflict: 'a target changed externally, HEAD moved to an unrecognised commit or Git failed, so the affected files were left untouched' };
         this.recordError(state, new SessionError('apply_interrupted', `Previous apply was interrupted; ${outcomes[apply.phase as keyof typeof outcomes]}; validation was not replayed.`));
       }
     } catch (error: unknown) {
@@ -266,11 +266,15 @@ export class SessionStore {
     if (base === null) unlinkSync(full); else writeFileSync(full, base);
     return 'restored';
   }
+  /** Restores every file by the restore() rule; returns the paths left untouched, while the others are still restored. */
+  private restoreAll(files: CandidateFile[]): string[] {
+    return files.filter(file => { try { return this.restore(file) === 'conflict'; } catch { return true; } }).map(file => file.path);
+  }
   private run(file: string, args: string[], cwd = this.root): Promise<CommandResult> {
     return new Promise(resolve => execFile(file, args, { cwd, env: commandEnv(), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_OUTPUT_LIMIT, windowsHide: true },
       (error, stdout, stderr) => resolve({ code: !error ? 0 : error.killed ? `killed (${error.signal ?? 'timeout or output limit'})` : error.code ?? 'failed', stdout, stderr })));
   }
-  /** Unstages only the target; a new file is dropped from the index, since `restore --staged` fails for paths absent from HEAD. */
+  /** Unstages only this file; a new file is dropped from the index, since `restore --staged` fails for paths absent from HEAD. */
   private unstageArgs(file: CandidateFile): string[] {
     return file.base === null ? ['--literal-pathspecs', 'rm', '--cached', '--quiet', '--ignore-unmatch', '--', file.path]
       : ['--literal-pathspecs', 'restore', '--staged', '--', file.path];
@@ -282,25 +286,30 @@ export class SessionStore {
   }
   /** Sync because the constructor and the exception path need it. Once HEAD has moved, files are never restored: they may be committed. */
   private recoverCommit(candidate: Candidate, head: string): 'committed' | 'restored' | 'conflict' | 'error' {
-    const [file] = candidate.files; // apply wrote this candidate, so it has a single file
+    const written = changes(candidate);
     try {
       const current = this.git('rev-parse', 'HEAD').trim();
       if (current !== head) {
         const ours = this.git('rev-parse', 'HEAD^').trim() === head && this.git('log', '-1', '--format=%B', 'HEAD').includes(`${CANDIDATE_TRAILER}: ${candidate.id}`);
         if (!ours) return 'conflict';
         const files = this.git('diff-tree', '--no-commit-id', '--name-only', '-r', '-z', 'HEAD').split('\0').filter(Boolean);
-        // The candidate passed the typecheck before the commit, so an exact single-file match is verified; anything else is not.
-        if (files.length === 1 && samePath(files[0], file.path) && this.git('show', `HEAD:${files[0]}`) === file.content) {
-          candidate.applyResult = { status: 'committed', diagnostics: ['recovered_after_crash: the apply was interrupted after Git created its commit; the commit holds exactly the candidate and was kept.'], changedFiles: [file.path] };
+        // The candidate passed the typecheck before the commit, so an exact match of its written files is verified; anything else is not.
+        // The count check matters on Windows, as in committedResult; blobs are read by Git's own spelling.
+        const exact = files.length === written.length && written.every(file => {
+          const name = files.find(path => samePath(path, file.path));
+          return name !== undefined && this.git('show', `HEAD:${name}`) === file.content;
+        });
+        if (exact) {
+          candidate.applyResult = { status: 'committed', diagnostics: ['recovered_after_crash: the apply was interrupted after Git created its commit; the commit holds exactly the candidate and was kept.'], changedFiles: written.map(file => file.path) };
           candidate.rawCommit = current;
           return 'committed';
         }
         candidate.applyResult = { status: 'error', diagnostics: [`committed_unverified: the apply was interrupted after Git created its commit, which differs from the candidate or touches other paths; it was kept and not typechecked: ${files.join(', ') || 'no paths'}`], changedFiles: files };
         return 'error';
       }
-      this.git(...this.unstageArgs(file));
+      for (const file of written) this.git(...this.unstageArgs(file));
     } catch { return 'conflict'; }
-    return this.restore(file);
+    return this.restoreAll(written).length ? 'conflict' : 'restored';
   }
   /** Returns formatted raw paths to the raw commit while HEAD is still on it and they hold the recorded content; returns the paths left untouched. */
   private unformat(formatted: Record<string, string>, raw: string | undefined): string[] {
@@ -319,7 +328,7 @@ export class SessionStore {
     try {
       // Tools may have written without recorded hashes: only an unchanged target is known to be untouched.
       if (apply.phase === 'postprocessing') {
-        return statusPaths(this.git('status', '--porcelain=v1', '-z', '--untracked-files=all')).some(path => candidate.files.some(file => samePath(path, file.path))) ? 'conflict' : 'postprocess_failed';
+        return statusPaths(this.git('status', '--porcelain=v1', '-z', '--untracked-files=all')).some(path => changes(candidate).some(file => samePath(path, file.path))) ? 'conflict' : 'postprocess_failed';
       }
       if (apply.phase === 'postprocess_committing') {
         if (this.git('rev-parse', 'HEAD').trim() !== candidate.rawCommit) {
@@ -334,21 +343,29 @@ export class SessionStore {
     } catch { return 'conflict'; }
     return this.unformat(formatted, candidate.rawCommit).length ? 'conflict' : 'postprocess_failed';
   }
-  /** Runs tsc only when the trusted config includes the target; a typecheck without the target is not validation. */
-  private async typecheck(tsc: string, tsconfig: string, full: string): Promise<{ listed: CommandResult; checked?: CommandResult }> {
-    const listed = await this.run(process.execPath, [tsc, '--listFilesOnly', '-p', tsconfig]), target = realpathSync(full);
-    const included = listed.code === 0 && listed.stdout.split(/\r?\n/).some(line => line.trim() && samePath(basename(line.trim()), basename(target)) && samePath(realpathSync(line.trim()), target));
-    return { listed, checked: included ? await this.run(process.execPath, [tsc, ...TYPECHECK_FLAGS, '-p', tsconfig]) : undefined };
+  /**
+   * Runs tsc only when the trusted config includes every TypeScript file of the workspace-relative `paths`: a typecheck without them
+   * is not validation. `missing` names those it lacks; a failed listing proves nothing, so then every path is missing.
+   */
+  private async typecheck(tsc: string, tsconfig: string, paths: string[]): Promise<{ listed: CommandResult; missing: string[]; checked?: CommandResult }> {
+    const listed = await this.run(process.execPath, [tsc, '--listFilesOnly', '-p', tsconfig]);
+    const program = listed.stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    const missing = listed.code !== 0 ? paths : paths.filter(path => TYPESCRIPT.test(path)).filter(path => {
+      const target = realpathSync(this.safePath(path, false));
+      return !program.some(line => samePath(basename(line), basename(target)) && samePath(realpathSync(line), target));
+    });
+    return { listed, missing, checked: missing.length ? undefined : await this.run(process.execPath, [tsc, ...TYPECHECK_FLAGS, '-p', tsconfig]) };
   }
   /**
    * Judges `commit`, the commit just made on `head`, from the expected files; nothing here reverts it, since history is never rewritten.
-   * Uses the SHA, not the symbolic HEAD: the developer may commit while the typecheck below runs.
+   * Uses the SHA, not the symbolic HEAD: the developer may commit while the typecheck below runs. A re-typecheck after hook changes
+   * requires and judges the `required` paths, as the check before the commit did.
    */
-  private async committedResult(head: string, commit: string, expected: Array<{ path: string; content: string }>, baseline: string[], tsc: string, tsconfig: string, full: string): Promise<Result<'committed' | 'error'>> {
+  private async committedResult(head: string, commit: string, expected: Array<{ path: string; content: string }>, baseline: string[], tsc: string, tsconfig: string, required: string[]): Promise<Result<'committed' | 'error'>> {
     const parent = await this.run('git', ['rev-parse', '--verify', `${commit}^`]), paths = expected.map(file => file.path);
     const files = (await this.run('git', ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', commit])).stdout.split('\0').filter(Boolean);
-    // The count check matters on Windows: case variants of one path would each pass samePath.
-    if (parent.stdout.trim() !== head || !files.length || files.length > paths.length || files.some(file => !paths.some(path => samePath(path, file)))) {
+    // Exactly the expected paths, no fewer and no more. The count check matters on Windows: case variants of one path would each pass samePath.
+    if (parent.stdout.trim() !== head || files.length !== paths.length || files.some(file => !paths.some(path => samePath(path, file)))) {
       return { status: 'error', diagnostics: [`commit_scope_violation: HEAD is not a commit of only the expected paths on the pre-commit HEAD; nothing was reverted: ${files.join(', ') || 'no paths'}`], changedFiles: files };
     }
     // Only changes that were not there before the commit can come from hooks; the developer's other work is not counted.
@@ -364,9 +381,9 @@ export class SessionStore {
     if (modified.some(file => blobs[expected.indexOf(file)].code !== 0) || left.length) {
       return { status: 'error', diagnostics: ['committed_unverified: hooks changed or removed committed files and the worktree differs from HEAD, so the commit was not typechecked; nothing was reverted.', diff, ...leftDiagnostics], changedFiles: paths };
     }
-    const { listed, checked } = await this.typecheck(tsc, tsconfig, full);
+    const { listed, checked } = await this.typecheck(tsc, tsconfig, required);
     // Errors only in other files are not the hooks' doing: the committed files themselves still typecheck.
-    if (checked && (checked.code === 0 || errorsOnlyElsewhere(checked, paths))) {
+    if (checked && (checked.code === 0 || errorsOnlyElsewhere(checked, required))) {
       return { status: 'committed', diagnostics: [diff, ...outsideNote(checked)], changedFiles: paths, hooksModified: true };
     }
     return { status: 'error', diagnostics: ['hooks_broke_typecheck: the hook-modified commit fails the typecheck; it stays in history and nothing was reverted.', ...commandDiagnostics(checked ?? listed), diff], changedFiles: paths };
@@ -384,6 +401,16 @@ export class SessionStore {
   private async staged(): Promise<string[] | null> {
     const staged = await this.run('git', ['diff', '--cached', '--name-only', '-z']);
     return staged.code === 0 ? staged.stdout.split('\0').filter(path => path && path !== STORE_DIR && !path.startsWith(`${STORE_DIR}/`)) : null;
+  }
+  /**
+   * Why the index does not hold exactly `own`, checked right before a commit: anything staged meanwhile would ride along in it,
+   * and an own file no longer staged would miss it. Empty when the index is as expected.
+   */
+  private async indexMismatch(own: string[]): Promise<string[]> {
+    const index = await this.staged();
+    if (!index) return ['(Git index unreadable)'];
+    return [...index.filter(path => !own.some(mine => samePath(mine, path))),
+      ...own.filter(mine => !index.some(path => samePath(mine, path))).map(mine => `${mine} (not staged)`)];
   }
   /** Uncommitted paths (from `baseline`) inside the typechecked program, besides `own`: the check saw them, the commit will not include them. */
   private dirtyInProgram(listed: CommandResult, baseline: string[], own: string[]): string[] {
@@ -405,27 +432,29 @@ export class SessionStore {
       return { state, candidate };
     };
     let { state, candidate } = approved();
-    const file = single(candidate);
     // Only final outcomes are stored (a completed failed typecheck or an existing commit), so a repeat never touches Git or tsc.
     if (candidate.applyResult) return candidate.applyResult;
     this.assertNoWriter();
     const config = this.tsconfigFile(tsconfigPath ?? this.tsconfig), tsconfig = config.full;
+    // Every candidate file is checked and judges the typecheck; only the changed ones are written and committed.
+    const paths = candidate.files.map(file => file.path), written = changes(candidate), writtenPaths = written.map(file => file.path);
     this.applyRunning = true;
     try {
-      // Other unstaged or untracked work may stay: only the target must be untouched and the index empty.
+      // Other unstaged or untracked work may stay: only the targets must be untouched and the index empty.
       const baseline = await this.changedPaths();
       if (!baseline) return outcome('error', 'git_unavailable: the workspace must be the root of a Git repository and git must be runnable.');
-      if (baseline.some(path => samePath(path, file.path))) return outcome('conflict', `target_dirty: ${file.path} has uncommitted changes; commit or remove them first.`);
+      const dirty = paths.filter(path => baseline.some(before => samePath(before, path)));
+      if (dirty.length) return outcome('conflict', `target_dirty: commit or remove the uncommitted changes in these targets first: ${dirty.join(', ')}`);
       const staged = await this.stagedConflict();
       if (staged) return staged;
       ({ state, candidate } = approved()); // re-read: the session may have changed while Git ran
       const changedContext = state.context.filter(snapshot => !this.matches(snapshot.path, snapshot.content)).map(snapshot => snapshot.path);
       if (changedContext.length) return outcome('conflict', `context_changed: refresh context and regenerate: ${changedContext.join(', ')}`);
-      const base = file.base?.content ?? null;
-      if (!this.matches(file.path, base)) return outcome('conflict', `target_changed: ${file.path} differs from the generation-time base.`);
-      const full = this.safePath(file.path, false);
-      if (!statSync(dirname(full), { throwIfNoEntry: false })?.isDirectory()) return outcome('error', `missing_directory: parent of ${file.path} must already exist.`);
-      if (file.content === base) return outcome('no_changes');
+      const changedTargets = candidate.files.filter(file => !this.matches(file.path, file.base?.content ?? null)).map(file => file.path);
+      if (changedTargets.length) return outcome('conflict', `target_changed: these targets differ from their generation-time bases: ${changedTargets.join(', ')}`);
+      const homeless = paths.filter(path => !statSync(dirname(this.safePath(path, false)), { throwIfNoEntry: false })?.isDirectory());
+      if (homeless.length) return outcome('error', `missing_directory: the parent directory must already exist for: ${homeless.join(', ')}`);
+      if (!written.length) return outcome('no_changes');
       const tsc = this.tscPath(dirname(tsconfig));
       if (!tsc) return outcome('error', `typescript_not_found: no typescript package resolves from ${config.path}.`);
       const journal = (phase: ApplyPhase, head?: string): void => { state.apply = { candidateId, phase, head }; this.save(state); };
@@ -433,23 +462,26 @@ export class SessionStore {
       let committingHead: string | undefined;
       journal('applying');
       try {
-        writeFileSync(full, file.content, { flag: base === null ? 'wx' : 'w' });
+        for (const file of written) writeFileSync(this.safePath(file.path, false), file.content, { flag: file.base === null ? 'wx' : 'w' });
         journal('validating');
-        const { listed, checked } = await this.typecheck(tsc, tsconfig, full);
+        const { listed, missing, checked } = await this.typecheck(tsc, tsconfig, paths);
         // The check sees the developer's uncommitted files, the commit does not: say so on success, and never burn the candidate on failure.
-        const uncommitted = this.dirtyInProgram(listed, baseline, [file.path]);
+        const uncommitted = this.dirtyInProgram(listed, baseline, paths);
         const uncommittedNote = uncommitted.length ? [`validated_with_uncommitted: the typecheck included uncommitted files, so the raw commit may not compile without them: ${uncommitted.join(', ')}`] : [];
         let failure: ApplyResult, final = false;
         if (!checked) {
-          failure = outcome('error', `target_not_in_typecheck: tsc --listFilesOnly -p ${config.path} does not include ${file.path}; a typecheck without the target is not validation. Apply again with the tsconfig of the target's package.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed)));
-        } else if (checked.code === 0 || errorsOnlyElsewhere(checked, [file.path])) {
-          // Passed: the target has no type errors. Errors only in other files (user decision: pre-existing or unfinished work in
-          // a monorepo) are reported, not blocking. New changes besides the target (paths not dirty before) mean validation wrote files.
-          const changed = await this.changedPaths() ?? [];
-          const foreign = changed.filter(path => !samePath(path, file.path) && !baseline.some(before => samePath(before, path)));
-          if (foreign.length || !changed.some(path => samePath(path, file.path))) {
+          failure = outcome('error', `target_not_in_typecheck: tsc --listFilesOnly -p ${config.path} does not include ${missing.join(', ')}; a typecheck without the candidate's TypeScript files is not validation. Apply again with the tsconfig of the targets' package.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed)));
+        } else if (checked.code === 0 || errorsOnlyElsewhere(checked, paths)) {
+          // Passed: the candidate files have no type errors. Errors only in other files (user decision: pre-existing or unfinished work
+          // in a monorepo) are reported, not blocking. New changes besides the targets (paths not dirty before) mean validation wrote files,
+          // and every written file must show as changed (one ignored by Git would silently miss the commit).
+          const status = await this.changedPaths(), changed = status ?? [];
+          const foreign = changed.filter(path => !paths.some(mine => samePath(mine, path)) && !baseline.some(before => samePath(before, path)));
+          const unseen = writtenPaths.filter(mine => !changed.some(path => samePath(mine, path)));
+          if (foreign.length || unseen.length) {
             journal('error');
-            return { status: 'error', diagnostics: [`unexpected_changes: validation passed but new changes besides the target appeared; nothing was reverted: ${foreign.join(', ') || 'Git status unavailable'}`], changedFiles: changed };
+            const found = status ? [...foreign, ...unseen.map(path => `${path} (shows no change)`)].join(', ') : 'Git status unavailable';
+            return { status: 'error', diagnostics: [`unexpected_changes: validation passed but new changes besides the targets appeared or a written target shows no change; nothing was reverted: ${found}`], changedFiles: changed };
           }
           const head = await this.run('git', ['rev-parse', '--verify', 'HEAD']);
           if (head.code !== 0) {
@@ -458,48 +490,51 @@ export class SessionStore {
             committingHead = head.stdout.trim();
             candidate.tsconfig = config.path; // saved with the journal, so a commit recovered after a crash keeps it too
             journal('committing', committingHead);
-            const added = await this.run('git', ['--literal-pathspecs', 'add', '--', file.path]);
-            // Anything staged while tsc ran would ride along in the commit, so the index is checked again right before it.
-            const sneaked = added.code === 0 ? (await this.staged() ?? ['(Git index unreadable)']).filter(path => !samePath(path, file.path)) : [];
+            const added = await this.run('git', ['--literal-pathspecs', 'add', '--', ...writtenPaths]);
+            const sneaked = added.code === 0 ? await this.indexMismatch(writtenPaths) : [];
+            const objective = state.objective.trim().split(/\r?\n/)[0].slice(0, MAX_SUBJECT_OBJECTIVE).trimEnd();
             const commit = added.code !== 0 ? added : sneaked.length ? undefined
-              // A plain commit of the index, which holds only the target (checked above). A pathspec commit would run hooks on a
+              // A plain commit of the index, which holds only the written files (checked above). A pathspec commit would run hooks on a
               // temporary index, so changes re-staged by hooks such as lint-staged would miss the real index.
-              : await this.run('git', ['commit', '-m', `${state.commitType}: ${base === null ? 'add' : 'update'} ${file.path}`, '-m', `${CANDIDATE_TRAILER}: ${candidateId}`]);
+              : await this.run('git', ['commit', '-m', `${state.commitType}: ${objective}`, '-m', `${CANDIDATE_TRAILER}: ${candidateId}`]);
             // A killed or timed-out git (e.g. a slow post-commit hook) may still have created the commit: HEAD decides, not the exit code.
             // Captured at once: later checks and postprocess must judge this commit even if the developer commits meanwhile.
             const created = commit && added.code === 0 ? (await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() : committingHead;
             const moved = commit !== undefined && commit.code !== 0 && created !== committingHead;
             if (commit && (commit.code === 0 || moved)) {
               // Every post-commit outcome is final: the commit stays in history and a retry must not commit again.
-              const judged = await this.committedResult(committingHead, created, [file], baseline, tsc, tsconfig, full);
+              const judged = await this.committedResult(committingHead, created, written, baseline, tsc, tsconfig, paths);
               if (judged.status === 'committed') candidate.rawCommit = created;
               const prefix = moved ? ['commit_exit_nonzero: git reported a failure after creating the commit; the commit was kept.', ...commandDiagnostics(commit)] : [];
               candidate.applyResult = { ...judged, diagnostics: [...prefix, ...judged.diagnostics, ...uncommittedNote, ...outsideNote(checked)] };
               journal(candidate.applyResult.status === 'committed' ? 'committed' : 'error');
               return candidate.applyResult;
             }
-            const unstaged = await this.run('git', this.unstageArgs(file));
-            const unstageNotes = unstaged.code === 0 ? [] : [`unstage_failed: ${file.path} may still be staged.`, ...commandDiagnostics(unstaged)];
-            failure = commit ? outcome('error', 'commit_failed: Git or a hook refused the commit; the target was unstaged and the candidate can be applied again.', ...commandDiagnostics(commit), ...unstageNotes)
-              : outcome('conflict', `index_not_clean: ${sneaked.join(', ')} was staged during the apply and would have joined the commit; it stays staged, the target was unstaged, and the candidate can be applied again.`, ...unstageNotes);
+            const unstageNotes: string[] = [];
+            for (const file of written) {
+              const unstaged = await this.run('git', this.unstageArgs(file));
+              if (unstaged.code !== 0) unstageNotes.push(`unstage_failed: ${file.path} may still be staged.`, ...commandDiagnostics(unstaged));
+            }
+            failure = commit ? outcome('error', 'commit_failed: Git or a hook refused the commit; the candidate files were unstaged and the candidate can be applied again.', ...commandDiagnostics(commit), ...unstageNotes)
+              : outcome('conflict', `index_not_clean: the index changed during the apply and does not hold exactly the candidate files: ${sneaked.join(', ')}; other staged paths stay staged, the candidate files were unstaged, and the candidate can be applied again.`, ...unstageNotes);
           }
         } else {
-          // Only real tsc errors in the target judge the candidate. A timeout, kill or failure without diagnostics must not burn it.
-          const completed = typeof checked.code === 'number', inTarget = completed && reportsErrorIn(checked, [file.path]);
-          // Errors in the target are the candidate's fault only when no uncommitted file in the program could cause them.
+          // Only real tsc errors in the candidate files judge the candidate. A timeout, kill or failure without diagnostics must not burn it.
+          const completed = typeof checked.code === 'number', inTarget = completed && reportsErrorIn(checked, paths);
+          // Errors in the candidate files are its fault only when no uncommitted file in the program could cause them.
           final = inTarget && !uncommitted.length;
           failure = final ? outcome('validation_failed', ...commandDiagnostics(checked))
-            : inTarget ? outcome('error', `typecheck_failed_with_uncommitted: tsc reports errors in the target while the program includes uncommitted files that may cause them (${uncommitted.join(', ')}); finish or commit that work, then apply the same candidate again.`, ...commandDiagnostics(checked))
-            : completed ? outcome('error', 'typecheck_unrecognized: tsc failed without error diagnostics (e.g. it crashed), so the target cannot be judged; the candidate can be applied again.', ...commandDiagnostics(checked))
+            : inTarget ? outcome('error', `typecheck_failed_with_uncommitted: tsc reports errors in the candidate files while the program includes uncommitted files that may cause them (${uncommitted.join(', ')}); finish or commit that work, then apply the same candidate again.`, ...commandDiagnostics(checked))
+            : completed ? outcome('error', 'typecheck_unrecognized: tsc failed without error diagnostics (e.g. it crashed), so the candidate cannot be judged; the candidate can be applied again.', ...commandDiagnostics(checked))
             : outcome('error', 'typecheck_not_completed: tsc did not finish; the candidate can be applied again.', ...commandDiagnostics(checked));
         }
-        const restored = this.restore(file) === 'restored';
-        if (!restored) failure = outcome('conflict', ...failure.diagnostics, `restore_conflict: ${file.path} changed during validation and was left untouched.`);
+        const left = this.restoreAll(written);
+        if (left.length) failure = outcome('conflict', ...failure.diagnostics, `restore_conflict: ${left.join(', ')} changed during validation and was left untouched.`);
         if (final) candidate.applyResult = failure; // a completed typecheck is final for this immutable candidate
-        journal(!restored ? 'conflict' : failure.status === 'error' ? 'error' : 'restored');
+        journal(left.length ? 'conflict' : failure.status === 'error' ? 'error' : 'restored');
         return failure;
       } catch (error: unknown) {
-        const phase = committingHead !== undefined ? this.recoverCommit(candidate, committingHead) : this.restore(file);
+        const phase = committingHead !== undefined ? this.recoverCommit(candidate, committingHead) : this.restoreAll(written).length ? 'conflict' : 'restored';
         journal(phase === 'restored' ? 'error' : phase);
         throw error;
       }
@@ -562,7 +597,7 @@ export class SessionStore {
       return { state, candidate, raw: candidate.rawCommit };
     };
     let { state, candidate, raw } = committed();
-    const target = candidate.files[0].path; // a raw commit exists only for a single-file candidate
+    const rawFiles = changes(candidate).map(file => file.path); // what candidate_apply committed
     // Only final outcomes are stored, so a repeat never runs tools, tsc or Git.
     if (candidate.postprocessResult) return candidate.postprocessResult;
     this.assertNoWriter();
@@ -578,14 +613,14 @@ export class SessionStore {
     if (!statSync(packageFull).isDirectory()) throw new SessionError('invalid_path', 'packageDir must be a workspace directory.');
     this.applyRunning = true;
     try {
-      // Other uncommitted work may stay, as in candidate_apply: only the raw commit's target must be untouched.
+      // Other uncommitted work may stay, as in candidate_apply: only the raw commit's files must be untouched.
       const baseline = await this.changedPaths();
       if (!baseline) return outcome('error', 'git_unavailable: the workspace must be the root of a Git repository and git must be runnable.');
       if ((await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() !== raw) {
         return outcome('conflict', 'head_moved: postprocess runs only directly on top of the raw commit, and HEAD has moved since candidate_apply.');
       }
-      const dirty = candidate.files.find(file => baseline.some(path => samePath(path, file.path)));
-      if (dirty) return outcome('conflict', `target_dirty: ${dirty.path} has uncommitted changes; commit or remove them first.`);
+      const dirty = rawFiles.filter(path => baseline.some(before => samePath(before, path)));
+      if (dirty.length) return outcome('conflict', `target_dirty: commit or remove the uncommitted changes in these targets first: ${dirty.join(', ')}`);
       const staged = await this.stagedConflict();
       if (staged) return staged;
       const paths = (await this.run('git', ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', raw])).stdout.split('\0').filter(Boolean);
@@ -593,13 +628,14 @@ export class SessionStore {
       if (!paths.length || missing.length) return outcome('error', `raw_paths_unavailable: every path of the raw commit must be a regular file: ${missing.join(', ') || 'no paths'}`);
       // Defence in depth: never format a commit that is not this candidate's raw commit of exactly its files.
       const rawMessage = (await this.run('git', ['log', '-1', '--format=%B', raw])).stdout;
-      if (paths.length !== candidate.files.length || paths.some(path => !candidate.files.some(file => samePath(file.path, path))) || !rawMessage.includes(`${CANDIDATE_TRAILER}: ${candidate.id}`)) {
+      if (paths.length !== rawFiles.length || paths.some(path => !rawFiles.some(file => samePath(file, path))) || !rawMessage.includes(`${CANDIDATE_TRAILER}: ${candidate.id}`)) {
         return outcome('error', `raw_commit_mismatch: the recorded raw commit is not a commit of exactly this candidate's files; nothing was changed: ${paths.join(', ') || 'no paths'}`);
       }
       // ESLint ignores files outside its base directory, which would silently look like no_changes.
       const toolPaths = paths.map(path => relative(packageFull, join(this.root, path)));
-      if (toolPaths.some(path => path.startsWith('..') || isAbsolute(path))) {
-        return outcome('error', `outside_package_dir: ${paths.join(', ')} is not inside ${packageRel}; pass the target's package as packageDir.`);
+      const outside = paths.filter((_, index) => toolPaths[index].startsWith('..') || isAbsolute(toolPaths[index]));
+      if (outside.length) {
+        return outcome('error', `outside_package_dir: ${outside.join(', ')} is not inside ${packageRel}; pass the targets' package as packageDir.`);
       }
       // A package without a linter or formatter is normal: such steps are skipped, but a declared tool that is not installed is an error.
       const skipped = names.filter(name => !this.declared(name, packageFull));
@@ -643,21 +679,21 @@ export class SessionStore {
         journal('postprocess_validating', formatted);
         let completed = false;
         if (!failure) {
-          const full = this.safePath(target, false), { listed, checked } = await this.typecheck(tsc, tsconfig, full);
-          const uncommitted = this.dirtyInProgram(listed, baseline, touched); // as in candidateApply
+          // All raw paths are required and judged, not only the touched ones: formatting one file can break another that imports it.
+          const { listed, missing, checked } = await this.typecheck(tsc, tsconfig, paths);
+          const uncommitted = this.dirtyInProgram(listed, baseline, paths); // as in candidateApply
           // As in candidateApply: errors only in other files are reported, not blocking.
-          if (checked && (checked.code === 0 || errorsOnlyElsewhere(checked, touched))) {
+          if (checked && (checked.code === 0 || errorsOnlyElsewhere(checked, paths))) {
             journal('postprocess_committing', formatted);
             const added = await this.run('git', ['--literal-pathspecs', 'add', '--', ...touched]);
-            // As in candidateApply: anything staged while tsc ran would ride along, so the index is checked again right before the commit.
-            const sneaked = added.code === 0 ? (await this.staged() ?? ['(Git index unreadable)']).filter(path => !touched.some(own => samePath(own, path))) : [];
+            const sneaked = added.code === 0 ? await this.indexMismatch(touched) : []; // as in candidateApply
             const commit = added.code !== 0 ? added : sneaked.length ? undefined
-              : await this.run('git', ['commit', '-m', `style: format ${target}`, '-m', `${POSTPROCESS_TRAILER}: ${candidate.id}`]);
+              : await this.run('git', ['commit', '-m', `style: format ${touched.length === 1 ? touched[0] : `${touched.length} files`}`, '-m', `${POSTPROCESS_TRAILER}: ${candidate.id}`]);
             // As in candidateApply: HEAD, not the exit code, decides whether a commit exists.
             const created = commit && added.code === 0 ? (await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() : raw;
             const moved = commit !== undefined && commit.code !== 0 && created !== raw;
             if (commit && (commit.code === 0 || moved)) {
-              const judged = await this.committedResult(raw, created, after, baseline, tsc, tsconfig, full);
+              const judged = await this.committedResult(raw, created, after, baseline, tsc, tsconfig, paths);
               const prefix = moved ? ['commit_exit_nonzero: git reported a failure after creating the commit; the commit was kept.', ...commandDiagnostics(commit)] : [];
               const uncommittedNote = uncommitted.length ? [`validated_with_uncommitted: the typecheck included uncommitted files: ${uncommitted.join(', ')}`] : [];
               return final({ ...judged, diagnostics: [...prefix, ...judged.diagnostics, ...notes, ...uncommittedNote, ...outsideNote(checked)] }, judged.status === 'committed' ? 'postprocessed' : 'error');
@@ -665,12 +701,12 @@ export class SessionStore {
             const unstaged = await this.run('git', ['--literal-pathspecs', 'restore', '--staged', '--', ...touched]);
             const unstageNotes = unstaged.code === 0 ? [] : [`unstage_failed: ${touched.join(', ')} may still be staged.`, ...commandDiagnostics(unstaged)];
             failure = commit ? ['commit_failed: Git or a hook refused the postprocess commit; the raw commit stays and postprocess can run again.', ...commandDiagnostics(commit), ...unstageNotes]
-              : [`index_not_clean: ${sneaked.join(', ')} was staged during postprocess and would have joined the commit; it stays staged and postprocess can run again.`, ...unstageNotes];
+              : [`index_not_clean: the index changed during postprocess and does not hold exactly the formatted files: ${sneaked.join(', ')}; other staged paths stay staged and postprocess can run again.`, ...unstageNotes];
           } else if (!checked) {
-            failure = [`target_not_in_typecheck: tsc --listFilesOnly -p ${config.path} does not include ${target}; a typecheck without the target is not validation.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed))];
+            failure = [`target_not_in_typecheck: tsc --listFilesOnly -p ${config.path} does not include ${missing.join(', ')}; a typecheck without the raw commit's TypeScript files is not validation.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed))];
           } else {
-            // Only real tsc errors in the formatted files, with no uncommitted file in the program to blame, judge the formatting.
-            const inTouched = typeof checked.code === 'number' && reportsErrorIn(checked, touched);
+            // Only real tsc errors in the raw commit's files, with no uncommitted file in the program to blame, judge the formatting.
+            const inTouched = typeof checked.code === 'number' && reportsErrorIn(checked, paths);
             completed = inTouched && !uncommitted.length;
             failure = [completed ? 'postprocess_broke_typecheck: the formatted files fail the typecheck; nothing was committed and the raw commit stays.'
               : inTouched ? `typecheck_failed_with_uncommitted: the formatted files fail the typecheck while the program includes uncommitted files that may cause it (${uncommitted.join(', ')}); finish or commit that work and run postprocess again.`

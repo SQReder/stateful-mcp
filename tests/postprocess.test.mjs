@@ -59,6 +59,24 @@ test('formatted raw paths that pass the typecheck get a separate style commit on
   assert.equal(f.head(), after);
 });
 
+test('postprocess formats every file of a multi-file raw commit and commits them together', async (t) => {
+  const f = await fixture(t);
+  tool(f, 'prettier', QUOTES);
+  const store = f.open('tsconfig.json', 'prettier');
+  const id = await f.session(store, { allowedPaths: ['source.ts', 'value.test.ts'] });
+  const c = await f.candidate(store, id, { files: [{ path: 'source.ts', content: 'export const value = 1;\nexport const label = "one";\n' }, { path: 'value.test.ts', content: PASSING }] });
+  assert.equal((await store.candidateApply(id, c)).status, 'committed');
+  const raw = f.head();
+  const result = await store.postprocess(id);
+  assert.deepEqual(result, { status: 'committed', diagnostics: [], changedFiles: ['source.ts', 'value.test.ts'] });
+  const commit = f.committed(raw);
+  assert.deepEqual(commit.files, ['source.ts', 'value.test.ts']);
+  assert.equal(commit.blob, FORMATTED);
+  assert.equal(f.run('show', 'HEAD:source.ts'), "export const value = 1;\nexport const label = 'one';\n");
+  assert.equal(commit.message.trim(), `style: format 2 files\n\nStateful-Worker-Postprocess: ${c}`);
+  assert.deepEqual(f.dirty(), []);
+});
+
 test('a formatter without changes returns no_changes and commits nothing', async (t) => {
   const { f, store, id, raw } = await rawCommit(t, { prettier: [SAME] });
   assert.deepEqual(await store.postprocess(id), { status: 'no_changes', diagnostics: [], changedFiles: [] });
