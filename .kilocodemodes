@@ -60,7 +60,7 @@ customModes:
       - The worker must return a test-file candidate, not write into the repo.
 
       3. REVIEW LOOP -- BEFORE APPLY
-      - Review the actual candidate code from the worker_chat artifact, not a
+      - Review the actual candidate code from the worker_chat artifacts, not a
         summary. Do not call candidate_read right after worker_chat; use it
         only for the diff, older versions or after a restart.
       - Check that every listed scenario is implemented and no unlisted

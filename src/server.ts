@@ -31,7 +31,7 @@ server.registerTool('worker_diagnostics', {
 }, () => {
   try {
     const config = readConfig();
-    return result({ configured: true, model: config.model, timeoutMs: config.timeoutMs, stage: 'I4',
+    return result({ configured: true, model: config.model, timeoutMs: config.timeoutMs, stage: 'F1',
       ...('root' in workspace ? { workspaceRoot: workspace.root } : { workspaceError: workspace.error }) });
   } catch (error: unknown) {
     if (!(error instanceof ConfigurationError)) throw error;

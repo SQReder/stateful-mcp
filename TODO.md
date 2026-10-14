@@ -66,7 +66,7 @@
 
 ## Stage 2 — features and bug fixes (F1–F4, user decision 2026-10-14)
 
-- [ ] F1: multi-file search/replace candidates with automatic parse feedback to the worker, no writes.
+- [x] F1: multi-file search/replace candidates with automatic parse feedback to the worker, no writes (`npm test`: 69 passed; independent review findings fixed).
 - [ ] F2: multi-file apply, commit and postprocess.
 - [ ] F3: run the candidate's test files with the package's vitest/jest as part of validation.
 - [ ] F4: `qwen-code-supervisor` role and a live feature E2E on `gpt-6-luna`.

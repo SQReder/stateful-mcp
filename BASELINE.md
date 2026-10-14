@@ -158,7 +158,7 @@ worker_chat(input: {
   message: string;
 }): {
   candidateId?: CandidateId;
-  artifact?: { path: string; content: string }; // with candidateId: code ready for review
+  artifacts?: Array<{ path: string; content: string; edits?: Array<{ search: string; replace: string }> }>; // with candidateId: code ready for review
   responsePreview?: string;                     // raw reply, only when no candidate was created
   usage: { inputTokens: number | null; outputTokens: number | null };
   finishReason: string;
