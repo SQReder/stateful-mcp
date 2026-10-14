@@ -20,7 +20,7 @@
 - Add fake-backend contract tests, MCP transport checks and an opt-in live smoke command.
 
 ### Changed
-- Allow unrelated unstaged and untracked work during `candidate_apply` and `postprocess`: only the target must be untouched (`target_dirty`) and the index empty (`index_not_clean`); tsc errors only outside the target give the retryable `typecheck_failed_elsewhere`.
+- Allow unrelated unstaged and untracked work during `candidate_apply` and `postprocess`: only the target must be untouched (`target_dirty`) and the index empty (`index_not_clean`); tsc errors only outside the target no longer block the commit and are reported as `typecheck_errors_outside_target`.
 - Run postprocess tools only where package.json of the package or a parent declares them, skipping undeclared ones (`tool_skipped`); `WORKER_POSTPROCESS` is optional and defaults to `eslint,prettier`.
 - Let the orchestrator choose the package tsconfig in `candidate_apply` (`tsconfig`, default `WORKER_TSCONFIG`) and the package directory in `postprocess` (`packageDir`, default the tsconfig's directory) for monorepos; `tsc`, prettier and eslint resolve from that package and the tools run there.
 - Derive the workspace root at startup from the Git repository of the MCP process's working directory instead of `WORKER_WORKSPACE_ROOT`; `worker_diagnostics` reports it.
