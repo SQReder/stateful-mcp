@@ -204,14 +204,16 @@ export class SessionStore {
     const latest = state.candidates.at(-1), problems = state.turns[last]?.problems;
     return JSON.stringify({ objective: state.objective, brief: state.brief,
       acceptanceCriteria: state.acceptanceCriteria, allowedPaths: targets.map(target => target.path), contextRevision: state.contextRevision,
-      targets: targets.map(({ path, base }) => base ? { path, content: base.content } : { path, new: true }),
+      // Without a BOM: edits match the text after it, and the BOM is kept on write.
+      targets: targets.map(({ path, base }) => base ? { path, content: base.content.replace(/^﻿/, '') } : { path, new: true }),
       // Targets are sent whole, so a context snapshot of the same file would only duplicate them.
       context: state.context.filter(snapshot => !targets.some(target => samePath(target.path, snapshot.path))),
       // As the worker wrote it: its edits refer to the bases of its own generation, not to the current targets.
       ...(latest ? { currentCandidate: { files: latest.files.map(({ path, edits, content }) => edits ? { path, edits } : { path, content }), contextRevision: latest.contextRevision }, previousRequest: exchange[0]?.text }
         : { lastSuccessfulExchange: exchange }),
-      // A reply that made no candidate gets its exact problems back; without them the worker repeats the same mistake.
-      ...(problems ? { previousReplyProblems: problems } : {}),
+      // A reply that made no candidate gets its exact problems back; without them the worker repeats the same mistake. With a
+      // candidate shown, that reply is not in the exchange above, so it comes along: the problems refer to its edits.
+      ...(problems ? { previousReplyProblems: problems, ...(latest ? { previousReply: state.turns[last].text } : {}) } : {}),
       // Feedback must describe the code sent as currentCandidate, so it comes only from the latest candidate.
       openFeedback: latest?.state === 'rejected' ? latest.findings : [],
       outputContract: { instruction: 'Return exactly one JSON object in the format below and nothing else: no Markdown, no other fields. '

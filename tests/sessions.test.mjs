@@ -414,6 +414,51 @@ test('placeholders and line-number prefixes are refused, while spread syntax and
   assert.ok((await store.workerChat(id, 'Write complete code')).candidateId);
 });
 
+test('placeholder phrases already in the base stay editable, ellipsis comments are refused, and ordinary comments pass', async (t) => {
+  const KEPT = 'export const x = 1;\n// rest of the file\n';
+  const f = await fixture(t, say({ files: [
+    { path: 'a.ts', content: 'it();\n// ... existing tests ...\n' },
+    { path: 'b.ts', content: 'it();\n// ... rest of tests\n' },
+    { path: 'c.ts', content: 'it();\n// ... (unchanged)\n' }] },
+  { files: [
+    { path: 'kept.ts', edits: [{ search: 'export const x = 1;', replace: 'export const x = 2;\n// rest of the file' }] },
+    { path: 'a.ts', content: [
+      '// keep compatible with existing code', '// skip the header, parse the rest of the file', '// previous value stays unchanged',
+      '/**', ' * ...', ' */', 'export {};', ''].join('\n') }] }));
+  const { store, id } = targets(f, { 'kept.ts': KEPT, 'a.ts': null, 'b.ts': null, 'c.ts': null });
+  const refused = await store.workerChat(id, 'Implement');
+  assert.deepEqual(refused.candidateDiagnostics.map(problem => [problem.code, problem.path]), [['placeholder', 'a.ts'], ['placeholder', 'b.ts'], ['placeholder', 'c.ts']]);
+  const accepted = await store.workerChat(id, 'Write complete code');
+  assert.ok(accepted.candidateId, JSON.stringify(accepted.candidateDiagnostics));
+  assert.equal(accepted.artifacts[0].content, 'export const x = 2;\n// rest of the file\n// rest of the file\n');
+});
+
+test('edits delete lines, change the first and last line without a final newline, empty a file, and drop a copied BOM', async (t) => {
+  const f = await fixture(t, say({ files: [
+    { path: 'del.ts', edits: [{ search: 'b\n', replace: '' }] },
+    { path: 'ends.ts', edits: [{ search: 'first', replace: 'FIRST' }, { search: 'last', replace: 'LAST' }] },
+    { path: 'all.ts', edits: [{ search: 'a\nb', replace: '' }] },
+    { path: 'bom.ts', edits: [{ search: '﻿import x;', replace: '﻿import y;' }] }] }));
+  const { store, id } = targets(f, { 'del.ts': 'a\nb\nc\n', 'ends.ts': 'first\nmiddle\nlast', 'all.ts': 'a\nb\n', 'bom.ts': '﻿import x;\n' });
+  const result = await store.workerChat(id, 'Implement');
+  assert.deepEqual(result.artifacts.map(artifact => artifact.content), ['a\nc\n', 'FIRST\nmiddle\nLAST', '', '﻿import y;\n'], JSON.stringify(result.candidateDiagnostics));
+  assert.equal(promptOf(f).targets.find(target => target.path === 'bom.ts').content, 'import x;\n'); // shown without the BOM
+});
+
+test('with a candidate already shown, a failed reply is sent back together with its problems', async (t) => {
+  const bad = { files: [{ path: 'value.test.ts', edits: [{ search: 'missing line', replace: 'x' }] }] };
+  const f = await fixture(t, say({ files: [{ path: 'value.test.ts', content: 'first();\n' }] }, bad, 'next'));
+  const store = f.open(), id = start(store);
+  writeFileSync(join(f.root, 'value.test.ts'), 'old();\n');
+  store.contextSet(id, context);
+  assert.ok((await store.workerChat(id, 'one')).candidateId);
+  assert.equal((await store.workerChat(id, 'two')).candidateDiagnostics[0].code, 'search_not_found');
+  await store.workerChat(id, 'three');
+  const prompt = promptOf(f);
+  assert.equal(prompt.previousReply, JSON.stringify(bad));
+  assert.equal(prompt.previousReplyProblems[0].code, 'search_not_found');
+});
+
 test('one outer fence around the whole reply is stripped, text around it is not, and the legacy path/content shape still works', async (t) => {
   const legacy = JSON.stringify({ path: 'value.test.ts', content: 'legacy();\n' });
   const f = await fixture(t, say(`\`\`\`json\n${JSON.stringify({ files: [{ path: 'value.test.ts', content: 'fenced();\n' }] })}\n\`\`\``,

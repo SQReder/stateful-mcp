@@ -14,14 +14,16 @@ const LCS_CELL_LIMIT = 1_000_000, DIFF_CONTEXT = 3;
 const SIMILARITY_CHARS = 200;
 const BOM = '﻿';
 const FENCE = /^```(?:json)?[ \t]*\r?\n([\s\S]*)\r?\n[ \t]*```$/i;
-const COMMENT = String.raw`(?:\/\/|#|\/\*+|\*|<!--|\{\/\*)`, DOTS = String.raw`(?:\.{3}|…)`;
-// Lines that stand for omitted code: `...` alone (optionally commented) or comments such as `// rest of the code`, `// existing code`,
-// `// other cases unchanged`. Spread syntax (`...args`) never stands alone on a line, and an ordinary comment like
-// `// value stays unchanged` passes: "unchanged" counts only after a word that refers to omitted code (rest, other, remaining…).
+const COMMENT = String.raw`(?:\/\/|#|\/\*+|<!--|\{\/\*)`, DOTS = String.raw`(?:\.{3}|…)`, END = String.raw`\s*(?:\*\/\}?|-->)?\s*$`;
+// Lines that stand for omitted code: `...` alone, a comment that starts with `...` (`// ... existing tests ...`), or a comment that
+// consists only of a phrase such as `// rest of the file`, `// existing code` or `// other cases unchanged`. Spread syntax never
+// stands alone on a line, and ordinary comments that merely contain such words (`// parse the rest of the file`) pass.
+// Lines already present in the base are never placeholders (see `filler`), so a file that has such a comment stays editable.
 const PLACEHOLDER = new RegExp([
-  String.raw`^\s*(?:${COMMENT}\s*)?${DOTS}\s*(?:\*\/\}?|-->)?\s*$`,
-  String.raw`^\s*${COMMENT}.*(?:\brest\s+of\s+(?:the\s+)?(?:code|file)\b|\bexisting\s+code\b)`,
-  String.raw`^\s*(?:\/\/|#|\/\*+)\s*${DOTS}?\s*\(?(?:rest|others?|remaining|everything|existing|previous)\b[\w\s-]*\bunchanged\)?\s*${DOTS}?\s*(?:\*\/)?\s*$`,
+  String.raw`^\s*(?:${COMMENT}\s*)?${DOTS}${END}`,
+  String.raw`^\s*${COMMENT}\s*${DOTS}`,
+  String.raw`^\s*${COMMENT}\s*\(?(?:the\s+)?(?:rest\s+of\s+(?:the\s+)?(?:code|file|tests?|class|function)|existing\s+(?:code|tests?))\)?${END}`,
+  String.raw`^\s*${COMMENT}\s*\(?(?:the\s+)?(?:rest|others?|remaining|everything\s+else|other\s+\w+)(?:\s+\w+){0,2}\s+(?:(?:remains?|stays?|is|are)\s+)?unchanged\)?${END}`,
 ].join('|'), 'i');
 // `12 | code` (optionally right-aligned) or `12: code` at column 0; indented `1: 'one'` object keys do not count.
 const LINE_NUMBER = /^(?:\s*\d+\s*\|(?:\s|$)|\d+:\s)/;
@@ -68,7 +70,7 @@ function notFound(lines: string[], needle: string[]): string {
   if (loose.length === 1) {
     return `"search" differs only in indentation/whitespace from lines ${loose[0] + 1}-${loose[0] + needle.length}, which are exactly: ${JSON.stringify(lines.slice(loose[0], loose[0] + needle.length).join('\n'))}.${advice}`;
   }
-  const first = needle.findIndex(line => line.trim()), start = closest(lines, needle[first]) - first;
+  const first = needle.findIndex(line => line.trim()), start = Math.max(0, closest(lines, needle[first]) - first);
   for (let offset = 0; offset < needle.length; offset++) {
     const actual = lines[start + offset], wanted = needle[offset];
     if (actual === wanted) continue;
@@ -80,12 +82,13 @@ function notFound(lines: string[], needle: string[]): string {
   return `"search" not found.${advice}`;
 }
 
-/** Why `text` (a replace block or whole-file content) is not real code, if it is not. */
-function filler(text: string): { code: string; message: string } | undefined {
-  const lines = text.split(/\r?\n/), placeholder = lines.findIndex(line => PLACEHOLDER.test(line));
+/** Why `text` (a replace block or whole-file content) is not real code, if it is not; lines copied from `base` never count. */
+function filler(text: string, base: string | null): { code: string; message: string } | undefined {
+  const existing = new Set((base ?? '').split(/\r?\n/));
+  const lines = text.split(/\r?\n/), placeholder = lines.findIndex(line => PLACEHOLDER.test(line) && !existing.has(line));
   if (placeholder >= 0) return { code: 'placeholder', message: `line ${placeholder + 1} ${JSON.stringify(lines[placeholder].trim())} stands for omitted code; write the complete code (edits already leave the rest of the file as it is).` };
   const filled = lines.filter(line => line.trim());
-  if (filled.length && filled.filter(line => LINE_NUMBER.test(line)).length * 2 > filled.length) {
+  if (filled.length && filled.filter(line => LINE_NUMBER.test(line) && !existing.has(line)).length * 2 > filled.length) {
     return { code: 'line_numbers', message: 'lines start with line-number prefixes such as "12 | " or "12: "; write the code without them.' };
   }
 }
@@ -98,10 +101,12 @@ function applyEdits(base: string, edits: Edit[], problem: (code: string, message
   let lines = (trailing ? text.slice(0, -1) : text).split('\n'), failed = false;
   edits.forEach((edit, index) => {
     const fail = (code: string, message: string): void => { failed = true; problem(code, message, index); };
-    const search = lf(edit.search).replace(/\n$/, ''), replace = lf(edit.replace).replace(/\n$/, ''), needle = search.split('\n');
+    // A BOM copied from a first line is dropped: matching runs on the text without it, and the result gets it back once.
+    const clean = (block: string): string => lf(block).replace(/^﻿/, '').replace(/\n$/, '');
+    const search = clean(edit.search), replace = clean(edit.replace), needle = search.split('\n');
     if (!search.trim()) return fail('invalid_candidate', `"search" is blank; copy 1-${MAX_SEARCH_LINES} complete lines from the target.`);
     if (needle.length > MAX_SEARCH_LINES) return fail('search_too_long', `"search" has ${needle.length} lines; use at most ${MAX_SEARCH_LINES} distinctive lines, or split the change into several edits.`);
-    const bad = filler(replace);
+    const bad = filler(replace, text);
     if (bad) return fail(bad.code, `"replace": ${bad.message}`);
     const found = occurrences(lines, needle);
     if (found.length > 1) return fail('search_ambiguous', `"search" matches ${found.length} times (lines ${found.map(start => start + 1).join(', ')}); add neighbouring lines to make it unique.`);
@@ -109,7 +114,8 @@ function applyEdits(base: string, edits: Edit[], problem: (code: string, message
     lines = [...lines.slice(0, found[0]), ...(replace ? replace.split('\n') : []), ...lines.slice(found[0] + needle.length)];
   });
   if (failed) return undefined;
-  const result = lines.join('\n') + (trailing ? '\n' : '');
+  // Removing every line leaves an empty file, not a lone newline.
+  const result = lines.length ? lines.join('\n') + (trailing ? '\n' : '') : '';
   return (bom ? BOM : '') + (endings === 'crlf' ? result.replaceAll('\n', '\r\n') : result);
 }
 
@@ -149,7 +155,7 @@ export function parseCandidate(reply: string, targets: Array<{ path: string; bas
     if (entry.edits) content = applyEdits(base!.content, entry.edits, problem);
     else if (!entry.content!.trim()) problem('invalid_candidate', '"content" is blank; give the complete file.');
     else {
-      const bad = filler(entry.content!);
+      const bad = filler(entry.content!, base?.content ?? null);
       if (bad) problem(bad.code, `"content": ${bad.message}`);
       // A whole-file replacement keeps the base's CRLF endings and BOM, like edits do.
       else content = base && lineEndings(base.content) === 'crlf' ? entry.content!.replace(/\r?\n/g, '\r\n') : entry.content!;
