@@ -64,6 +64,13 @@
 - [x] Require only an untouched target and an empty index; report uncommitted files in the tsc program (`validated_with_uncommitted`), never burn a candidate when they may cause target errors, re-check the index right before committing (`npm test`: 57 passed; independent review findings fixed).
 - [ ] Known limit: a hook that stages other files (e.g. `git add .`) or rewrites an already-dirty file is seen only after the commit (`commit_scope_violation`) or not at all; preventing it would need bypassing hooks.
 
+## Stage 2 — features and bug fixes (F1–F4, user decision 2026-10-14)
+
+- [ ] F1: multi-file search/replace candidates with automatic parse feedback to the worker, no writes.
+- [ ] F2: multi-file apply, commit and postprocess.
+- [ ] F3: run the candidate's test files with the package's vitest/jest as part of validation.
+- [ ] F4: `qwen-code-supervisor` role and a live feature E2E on `gpt-6-luna`.
+
 ## Deployment/pilot checks
 
 - [ ] Verify target Qwen3-Next access, tokenizer/window and quality in the corporate environment; does not block local I1 by user decision.
