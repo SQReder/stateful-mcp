@@ -69,7 +69,8 @@
 - [x] F1: multi-file search/replace candidates with automatic parse feedback to the worker, no writes (`npm test`: 69 passed; independent review findings fixed).
 - [x] F2: multi-file apply, commit and postprocess (`npm test`: 80 passed; independent review findings fixed).
 - [ ] Known limit: a candidate without TypeScript files skips the inclusion gate, so a `.json` change that breaks an importing `.ts` counts as an error elsewhere.
-- [ ] F3: run the candidate's test files with the package's vitest/jest as part of validation.
+- [x] F3: run the candidate's test files with the package's vitest/jest as part of validation (`npm test`: 90 passed with fake runners; independent review findings fixed).
+- [ ] Verify the F3 runner contract with real vitest and jest (JSON report shape, `--outputFile`, `CI=1` snapshot behaviour, jest `testMatch` with `--runTestsByPath`).
 - [ ] F4: `qwen-code-supervisor` role and a live feature E2E on `gpt-6-luna`.
 
 ## Deployment/pilot checks

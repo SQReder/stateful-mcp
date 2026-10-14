@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Run the candidate's test files with the package's vitest or jest after the typecheck and before the raw commit; failures restore the files and stay retryable, and `candidate_apply` takes `packageDir`.
 - Apply, commit and postprocess multi-file candidates: per-file preconditions, only changed files written and committed, every TypeScript file required in the typecheck, per-file restore.
 - Accept multi-file candidates: 1-8 target files per session, exact whole-line search/replace edits or complete content per file, minimal review diffs, and parse problems with hints fed back to the worker; `commitType` (`test`, `feat`, `fix`) names the raw commit.
 - Add `postprocess`: run trusted `WORKER_POSTPROCESS` tools (prettier, eslint) only on raw-commit paths directly on top of the raw commit, re-typecheck and commit the changes separately; failures return files to the raw commit, which always stays.
