@@ -56,8 +56,8 @@ export async function fixture(t, { base = null, git = true } = {}) {
     if (verdict) store.candidateReview(id, candidateId, verdict, []);
     return candidateId;
   }
-  async function session(store) {
-    const id = store.start({ objective: 'Add tests', allowedPaths: ['value.test.ts'] }).sessionId;
+  async function session(store, extra = {}) {
+    const id = store.start({ objective: 'Add tests', allowedPaths: ['value.test.ts'], ...extra }).sessionId;
     store.contextSet(id, { files: ['source.ts'], brief: 'Test the value', acceptanceCriteria: ['Value is a number'] });
     return id;
   }

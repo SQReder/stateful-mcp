@@ -4,8 +4,8 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync,
 import { createRequire } from 'node:module';
 import { basename, dirname, isAbsolute, join, relative, parse, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { MAX_SEARCH_LINES, parseCandidate, unifiedDiff, type CandidateFile, type Problem, type Snapshot } from './candidates.js';
 import { chat, type WorkerConfig } from './worker.js';
-import { z } from 'zod';
 
 // The corporate window is 96K tokens; 64K input is the user's safe ceiling, leaving room for the output reserve.
 const HARD_BUDGET = 64_000, WARNING_BUDGET = 48_000, OUTPUT_RESERVE = 8192;
@@ -29,13 +29,14 @@ type Result<Status extends string> = { status: Status; diagnostics: string[]; ch
 export type ApplyResult = Result<'committed' | 'validation_failed' | 'conflict' | 'no_changes' | 'error'>;
 export type PostprocessResult = Result<'committed' | 'no_changes' | 'failed' | 'conflict' | 'error'>;
 interface CommandResult { code: number | string; stdout: string; stderr: string }
-interface Snapshot { path: string; content: string; contentHash: string; estimatedTokens: number }
-interface Turn { role: 'supervisor' | 'worker'; text: string; contextRevision: number }
+export type CommitType = 'test' | 'feat' | 'fix';
+const MAX_ALLOWED_PATHS = 8;
+// problems: why this worker reply made no candidate; the next prompt repeats them to the worker.
+interface Turn { role: 'supervisor' | 'worker'; text: string; contextRevision: number; problems?: Problem[] }
 interface StoredError { code: string; message: string; contextRevision: number }
 export interface ReviewFinding { severity: 'blocker' | 'major' | 'minor'; message: string; location?: string }
 interface Candidate {
-  readonly id: string; readonly path: string; readonly content: string; readonly diff: string;
-  readonly contextRevision: number; readonly base: Snapshot | null;
+  readonly id: string; readonly files: CandidateFile[]; readonly contextRevision: number;
   state: 'draft' | 'approved' | 'rejected'; findings: ReviewFinding[];
   reviews: Array<{ verdict: 'approve' | 'reject'; findings: ReviewFinding[]; contextRevision: number }>;
   applyResult?: ApplyResult;
@@ -43,9 +44,8 @@ interface Candidate {
   tsconfig?: string; // internal: the tsconfig the raw commit was validated with; postprocess reuses it
   postprocessResult?: PostprocessResult;
 }
-const artifactSchema = z.object({ path: z.string(), content: z.string().refine(value => value.trim().length > 0) }).strict();
 interface Session {
-  id: string; workspaceRoot: string; objective: string; allowedPaths: string[];
+  id: string; workspaceRoot: string; objective: string; allowedPaths: string[]; commitType: CommitType;
   brief: string; acceptanceCriteria: string[]; contextRevision: number;
   context: Snapshot[]; turns: Turn[]; errors: StoredError[]; pending: boolean; candidates: Candidate[];
   // formatted: content hashes of postprocessed raw paths; only files still holding them are restored.
@@ -64,6 +64,22 @@ const outcome = <Status extends string>(status: Status, ...diagnostics: string[]
 const capped = (label: string, text: string): string => text.length <= DIAGNOSTIC_LIMIT ? `${label}: ${text}`
   : `${label} (truncated to first ${DIAGNOSTIC_LIMIT} of ${text.length} chars): ${text.slice(0, DIAGNOSTIC_LIMIT)}`;
 const commandDiagnostics = (result: CommandResult): string[] => [`exit code: ${result.code}`, capped('stdout', result.stdout), capped('stderr', result.stderr)];
+const slash = (path: string): string => path.replaceAll('\\', '/');
+/** F1 writes single-file candidates only; F2 lifts this. */
+const single = (candidate: Candidate): CandidateFile => {
+  if (candidate.files.length !== 1) throw new SessionError('multi_file_apply_unsupported', 'Applying a candidate with several files is not supported yet; nothing was written.');
+  return candidate.files[0];
+};
+/** Sessions stored before multi-file candidates: the commit type defaults to test and a single-file candidate moves into `files`. */
+const upgrade = (state: Session): Session => {
+  state.commitType ??= 'test';
+  state.candidates = (state.candidates ?? []).map(candidate => {
+    if ('files' in candidate) return candidate;
+    const { path, content, base, diff, ...rest } = candidate as Omit<Candidate, 'files'> & Omit<CandidateFile, 'edits'>;
+    return { ...rest, files: [{ path, base, content, diff }] };
+  });
+  return state;
+};
 const samePath = (first: string, second: string): boolean => process.platform === 'win32' ? first.toLowerCase() === second.toLowerCase() : first === second;
 /**
  * Whether tsc output reports an error in one of the workspace-relative `paths`. tsc runs from the workspace root and prints
@@ -116,7 +132,7 @@ export class SessionStore {
         this.recordError(state, new SessionError('interrupted', 'Previous inference was interrupted; no request was replayed.'));
       }
       for (const row of this.db.prepare(`SELECT state FROM sessions WHERE json_extract(state, '$.apply.phase') IN ${BUSY_PHASES}`).all()) {
-        const state: Session = JSON.parse(String(row.state)), apply = state.apply!, candidate = this.candidate(state, apply.candidateId);
+        const state = upgrade(JSON.parse(String(row.state))), apply = state.apply!, candidate = this.candidate(state, apply.candidateId);
         if (POSTPROCESS_BUSY.includes(apply.phase)) {
           apply.phase = this.recoverPostprocess(apply, candidate);
           const outcomes = { postprocessed: 'its commit exists and was kept without re-verification', postprocess_failed: 'raw paths are at the raw commit and postprocess can run again',
@@ -124,7 +140,7 @@ export class SessionStore {
           this.recordError(state, new SessionError('postprocess_interrupted', `Previous postprocess was interrupted; ${outcomes[apply.phase as keyof typeof outcomes]}.`));
           continue;
         }
-        apply.phase = apply.phase === 'committing' ? this.recoverCommit(candidate, apply.head ?? '') : this.restore(candidate);
+        apply.phase = apply.phase === 'committing' ? this.recoverCommit(candidate, apply.head ?? '') : this.restore(candidate.files[0]);
         const outcomes = { committed: 'its commit exists and was kept', error: 'its commit exists but differs from the candidate; it was kept unverified',
           restored: 'target is at its base', conflict: 'the target changed externally, HEAD moved to an unrecognised commit or Git failed, so files were left untouched' };
         this.recordError(state, new SessionError('apply_interrupted', `Previous apply was interrupted; ${outcomes[apply.phase as keyof typeof outcomes]}; validation was not replayed.`));
@@ -146,8 +162,7 @@ export class SessionStore {
   private load(id: string): Session {
     const row = this.db.prepare('SELECT state FROM sessions WHERE id = ?').get(id);
     if (!row) throw new SessionError('session_not_found', 'Session not found.');
-    const state: Session = JSON.parse(String(row.state));
-    state.candidates ??= [];
+    const state = upgrade(JSON.parse(String(row.state)));
     if (state.workspaceRoot !== this.root) throw new SessionError('workspace_mismatch', 'Session belongs to another workspace.');
     return state;
   }
@@ -179,18 +194,33 @@ export class SessionStore {
     }
     return full;
   }
-  private prompt(state: Session, message = ''): string {
+  /** The allowed files as they are now (null: new file): shown to the worker and kept as the bases its edits apply to. */
+  private targets(state: Session): Array<{ path: string; base: Snapshot | null }> {
+    return state.allowedPaths.map(path => ({ path: slash(path), base: this.targetBase(path) }));
+  }
+  private prompt(state: Session, message = '', targets = this.targets(state)): string {
     const last = state.turns.findLastIndex(turn => turn.role === 'worker');
     const exchange = last < 0 ? [] : state.turns.slice(last - 1, last + 1);
-    const latest = state.candidates.at(-1);
+    const latest = state.candidates.at(-1), problems = state.turns[last]?.problems;
     return JSON.stringify({ objective: state.objective, brief: state.brief,
-      acceptanceCriteria: state.acceptanceCriteria, allowedPaths: state.allowedPaths,
-      contextRevision: state.contextRevision, context: state.context,
-      ...(latest ? { currentCandidate: { path: latest.path, content: latest.content, contextRevision: latest.contextRevision }, previousRequest: exchange[0]?.text }
+      acceptanceCriteria: state.acceptanceCriteria, allowedPaths: targets.map(target => target.path), contextRevision: state.contextRevision,
+      targets: targets.map(({ path, base }) => base ? { path, content: base.content } : { path, new: true }),
+      // Targets are sent whole, so a context snapshot of the same file would only duplicate them.
+      context: state.context.filter(snapshot => !targets.some(target => samePath(target.path, snapshot.path))),
+      // As the worker wrote it: its edits refer to the bases of its own generation, not to the current targets.
+      ...(latest ? { currentCandidate: { files: latest.files.map(({ path, edits, content }) => edits ? { path, edits } : { path, content }), contextRevision: latest.contextRevision }, previousRequest: exchange[0]?.text }
         : { lastSuccessfulExchange: exchange }),
+      // A reply that made no candidate gets its exact problems back; without them the worker repeats the same mistake.
+      ...(problems ? { previousReplyProblems: problems } : {}),
       // Feedback must describe the code sent as currentCandidate, so it comes only from the latest candidate.
       openFeedback: latest?.state === 'rejected' ? latest.findings : [],
-      outputContract: { instruction: 'Return exactly one JSON object with path and content; no Markdown or additional fields. Content must be the complete test file. Implement exactly the listed acceptance criteria: do not add, drop or change any.', path: state.allowedPaths[0].replaceAll('\\', '/') },
+      outputContract: { instruction: 'Return exactly one JSON object in the format below and nothing else: no Markdown, no other fields. '
+        + 'List the files you change; each path must be one of allowedPaths, at most once. An existing target takes "edits" or its complete "content"; a new target (new: true) takes its complete "content". '
+        + 'Edits apply to the target snapshots shown in targets, not to currentCandidate: every reply is a complete candidate, so repeat each change you still want. '
+        + `Each "search" is 1-${MAX_SEARCH_LINES} complete consecutive lines copied exactly from the target (same indentation, no line numbers) and must occur exactly once; edits of a file apply in order, each to the text left by the previous ones. `
+        + 'If edits do not fit, give the complete "content" of the file instead. Never use placeholders such as "..." or "// rest of the code"; write complete code. '
+        + 'Implement exactly the listed acceptance criteria: do not add, drop or change any.',
+      format: '{"files":[{"path":"<existing target>","edits":[{"search":"<exact lines>","replace":"<new lines>"}]},{"path":"<target>","content":"<complete file>"}]}' },
       currentMessage: message });
   }
   private targetBase(path: string): Snapshot | null {
@@ -201,38 +231,14 @@ export class SessionStore {
     if (stat.size > BigInt(MAX_FILE_BYTES)) throw new SessionError('budget_exceeded', 'Target base exceeds the snapshot budget.');
     return this.readSnapshot(path, full, stat);
   }
-  private replacementDiff(path: string, base: string | null, content: string): string {
-    if (base === content) return '';
-    const split = (text: string): string[] => text ? text.split('\n').slice(0, text.endsWith('\n') ? -1 : undefined) : [];
-    const before = split(base ?? ''), after = split(content);
-    const block = (lines: string[], text: string, sign: string): string => lines.map((line, index) =>
-      `${sign}${line}\n${index === lines.length - 1 && !text.endsWith('\n') ? '\\ No newline at end of file\n' : ''}`).join('');
-    return `--- ${base === null ? '/dev/null' : `a/${path}`}\n+++ b/${path}\n@@ -${before.length ? 1 : 0},${before.length} +${after.length ? 1 : 0},${after.length} @@\n`
-      + block(before, base ?? '', '-') + block(after, content, '+');
-  }
-  private addCandidate(state: Session, response: string, base: Snapshot | null): string {
-    let value: unknown;
-    try { value = JSON.parse(response); } catch { throw new SessionError('invalid_candidate', 'Reply is not a single JSON artifact; no candidate created.'); }
-    const parsed = artifactSchema.safeParse(value);
-    if (!parsed.success) throw new SessionError('invalid_candidate', 'Artifact must contain only path and nonblank complete content; no candidate created.');
-    const path = state.allowedPaths[0].replaceAll('\\', '/');
-    if (parsed.data.path !== path) throw new SessionError('invalid_candidate_path', 'Artifact path differs from the allowed target; no candidate created.');
-    // Apply and restore compare files through budget-limited reads, so a larger candidate could never be recognised and restored.
-    if (Buffer.byteLength(parsed.data.content, 'utf8') > MAX_FILE_BYTES) throw new SessionError('invalid_candidate', `Artifact exceeds ${MAX_FILE_BYTES} bytes; no candidate created.`);
-    const id = randomUUID();
-    state.candidates.push({ id, path, content: parsed.data.content, base,
-      diff: this.replacementDiff(path, base?.content ?? null, parsed.data.content), contextRevision: state.contextRevision,
-      state: 'draft', findings: [], reviews: [] });
-    return id;
-  }
   private candidate(state: Session, id: string): Candidate {
     const candidate = state.candidates.find(candidate => candidate.id === id);
     if (!candidate) throw new SessionError('candidate_not_found', 'Candidate not found in this session.');
     return candidate;
   }
-  candidateRead(id: string, candidateId: string): { artifacts: Array<{ path: string; content: string; diff: string }>; contextRevision: number; currentContextRevision: number; state: string; findings: ReviewFinding[]; reviews: Candidate['reviews'] } {
+  candidateRead(id: string, candidateId: string): { artifacts: Array<Omit<CandidateFile, 'base'>>; contextRevision: number; currentContextRevision: number; state: string; findings: ReviewFinding[]; reviews: Candidate['reviews'] } {
     const state = this.load(id), candidate = this.candidate(state, candidateId);
-    return { artifacts: [{ path: candidate.path, content: candidate.content, diff: candidate.diff }],
+    return { artifacts: candidate.files.map(({ path, content, diff, edits }) => ({ path, content, diff, ...(edits ? { edits } : {}) })),
       contextRevision: candidate.contextRevision, currentContextRevision: state.contextRevision,
       state: candidate.contextRevision === state.contextRevision ? candidate.state : 'stale', findings: candidate.findings, reviews: candidate.reviews };
   }
@@ -250,11 +256,11 @@ export class SessionStore {
     // Unreadable, oversized or unsafe files never match: they are treated as foreign and left untouched.
     try { return (this.targetBase(path)?.content ?? null) === expected; } catch { return false; }
   }
-  private restore(candidate: Candidate): 'restored' | 'conflict' {
-    const base = candidate.base?.content ?? null;
-    if (!this.matches(candidate.path, candidate.content)) return this.matches(candidate.path, base) ? 'restored' : 'conflict';
+  private restore(file: CandidateFile): 'restored' | 'conflict' {
+    const base = file.base?.content ?? null;
+    if (!this.matches(file.path, file.content)) return this.matches(file.path, base) ? 'restored' : 'conflict';
     // shortcut: compare-then-write leaves a small race with external editors; Git status checks catch most of it.
-    const full = this.safePath(candidate.path, false);
+    const full = this.safePath(file.path, false);
     if (base === null) unlinkSync(full); else writeFileSync(full, base);
     return 'restored';
   }
@@ -263,9 +269,9 @@ export class SessionStore {
       (error, stdout, stderr) => resolve({ code: !error ? 0 : error.killed ? `killed (${error.signal ?? 'timeout or output limit'})` : error.code ?? 'failed', stdout, stderr })));
   }
   /** Unstages only the target; a new file is dropped from the index, since `restore --staged` fails for paths absent from HEAD. */
-  private unstageArgs(candidate: Candidate): string[] {
-    return candidate.base === null ? ['--literal-pathspecs', 'rm', '--cached', '--quiet', '--ignore-unmatch', '--', candidate.path]
-      : ['--literal-pathspecs', 'restore', '--staged', '--', candidate.path];
+  private unstageArgs(file: CandidateFile): string[] {
+    return file.base === null ? ['--literal-pathspecs', 'rm', '--cached', '--quiet', '--ignore-unmatch', '--', file.path]
+      : ['--literal-pathspecs', 'restore', '--staged', '--', file.path];
   }
   /** Sync Git for the constructor and exception paths. */
   private git(...args: string[]): string {
@@ -274,6 +280,7 @@ export class SessionStore {
   }
   /** Sync because the constructor and the exception path need it. Once HEAD has moved, files are never restored: they may be committed. */
   private recoverCommit(candidate: Candidate, head: string): 'committed' | 'restored' | 'conflict' | 'error' {
+    const [file] = candidate.files; // apply wrote this candidate, so it has a single file
     try {
       const current = this.git('rev-parse', 'HEAD').trim();
       if (current !== head) {
@@ -281,17 +288,17 @@ export class SessionStore {
         if (!ours) return 'conflict';
         const files = this.git('diff-tree', '--no-commit-id', '--name-only', '-r', '-z', 'HEAD').split('\0').filter(Boolean);
         // The candidate passed the typecheck before the commit, so an exact single-file match is verified; anything else is not.
-        if (files.length === 1 && samePath(files[0], candidate.path) && this.git('show', `HEAD:${files[0]}`) === candidate.content) {
-          candidate.applyResult = { status: 'committed', diagnostics: ['recovered_after_crash: the apply was interrupted after Git created its commit; the commit holds exactly the candidate and was kept.'], changedFiles: [candidate.path] };
+        if (files.length === 1 && samePath(files[0], file.path) && this.git('show', `HEAD:${files[0]}`) === file.content) {
+          candidate.applyResult = { status: 'committed', diagnostics: ['recovered_after_crash: the apply was interrupted after Git created its commit; the commit holds exactly the candidate and was kept.'], changedFiles: [file.path] };
           candidate.rawCommit = current;
           return 'committed';
         }
         candidate.applyResult = { status: 'error', diagnostics: [`committed_unverified: the apply was interrupted after Git created its commit, which differs from the candidate or touches other paths; it was kept and not typechecked: ${files.join(', ') || 'no paths'}`], changedFiles: files };
         return 'error';
       }
-      this.git(...this.unstageArgs(candidate));
+      this.git(...this.unstageArgs(file));
     } catch { return 'conflict'; }
-    return this.restore(candidate);
+    return this.restore(file);
   }
   /** Returns formatted raw paths to the raw commit while HEAD is still on it and they hold the recorded content; returns the paths left untouched. */
   private unformat(formatted: Record<string, string>, raw: string | undefined): string[] {
@@ -310,7 +317,7 @@ export class SessionStore {
     try {
       // Tools may have written without recorded hashes: only an unchanged target is known to be untouched.
       if (apply.phase === 'postprocessing') {
-        return statusPaths(this.git('status', '--porcelain=v1', '-z', '--untracked-files=all')).some(path => samePath(path, candidate.path)) ? 'conflict' : 'postprocess_failed';
+        return statusPaths(this.git('status', '--porcelain=v1', '-z', '--untracked-files=all')).some(path => candidate.files.some(file => samePath(path, file.path))) ? 'conflict' : 'postprocess_failed';
       }
       if (apply.phase === 'postprocess_committing') {
         if (this.git('rev-parse', 'HEAD').trim() !== candidate.rawCommit) {
@@ -351,7 +358,7 @@ export class SessionStore {
     const modified = expected.filter((file, index) => blobs[index].code !== 0 || blobs[index].stdout !== file.content);
     if (!modified.length) return { status: 'committed', diagnostics: leftDiagnostics, changedFiles: paths };
     const diff = capped('hooks_modified: hooks changed committed files; diff expected -> committed',
-      modified.map(file => this.replacementDiff(file.path, file.content, blobs[expected.indexOf(file)].stdout)).join(''));
+      modified.map(file => unifiedDiff(file.path, file.content, blobs[expected.indexOf(file)].stdout)).join(''));
     if (modified.some(file => blobs[expected.indexOf(file)].code !== 0) || left.length) {
       return { status: 'error', diagnostics: ['committed_unverified: hooks changed or removed committed files and the worktree differs from HEAD, so the commit was not typechecked; nothing was reverted.', diff, ...leftDiagnostics], changedFiles: paths };
     }
@@ -396,6 +403,7 @@ export class SessionStore {
       return { state, candidate };
     };
     let { state, candidate } = approved();
+    const file = single(candidate);
     // Only final outcomes are stored (a completed failed typecheck or an existing commit), so a repeat never touches Git or tsc.
     if (candidate.applyResult) return candidate.applyResult;
     this.assertNoWriter();
@@ -405,17 +413,17 @@ export class SessionStore {
       // Other unstaged or untracked work may stay: only the target must be untouched and the index empty.
       const baseline = await this.changedPaths();
       if (!baseline) return outcome('error', 'git_unavailable: the workspace must be the root of a Git repository and git must be runnable.');
-      if (baseline.some(path => samePath(path, candidate.path))) return outcome('conflict', `target_dirty: ${candidate.path} has uncommitted changes; commit or remove them first.`);
+      if (baseline.some(path => samePath(path, file.path))) return outcome('conflict', `target_dirty: ${file.path} has uncommitted changes; commit or remove them first.`);
       const staged = await this.stagedConflict();
       if (staged) return staged;
       ({ state, candidate } = approved()); // re-read: the session may have changed while Git ran
       const changedContext = state.context.filter(snapshot => !this.matches(snapshot.path, snapshot.content)).map(snapshot => snapshot.path);
       if (changedContext.length) return outcome('conflict', `context_changed: refresh context and regenerate: ${changedContext.join(', ')}`);
-      const base = candidate.base?.content ?? null;
-      if (!this.matches(candidate.path, base)) return outcome('conflict', `target_changed: ${candidate.path} differs from the generation-time base.`);
-      const full = this.safePath(candidate.path, false);
-      if (!statSync(dirname(full), { throwIfNoEntry: false })?.isDirectory()) return outcome('error', `missing_directory: parent of ${candidate.path} must already exist.`);
-      if (candidate.content === base) return outcome('no_changes');
+      const base = file.base?.content ?? null;
+      if (!this.matches(file.path, base)) return outcome('conflict', `target_changed: ${file.path} differs from the generation-time base.`);
+      const full = this.safePath(file.path, false);
+      if (!statSync(dirname(full), { throwIfNoEntry: false })?.isDirectory()) return outcome('error', `missing_directory: parent of ${file.path} must already exist.`);
+      if (file.content === base) return outcome('no_changes');
       const tsc = this.tscPath(dirname(tsconfig));
       if (!tsc) return outcome('error', `typescript_not_found: no typescript package resolves from ${config.path}.`);
       const journal = (phase: ApplyPhase, head?: string): void => { state.apply = { candidateId, phase, head }; this.save(state); };
@@ -423,21 +431,21 @@ export class SessionStore {
       let committingHead: string | undefined;
       journal('applying');
       try {
-        writeFileSync(full, candidate.content, { flag: base === null ? 'wx' : 'w' });
+        writeFileSync(full, file.content, { flag: base === null ? 'wx' : 'w' });
         journal('validating');
         const { listed, checked } = await this.typecheck(tsc, tsconfig, full);
         // The check sees the developer's uncommitted files, the commit does not: say so on success, and never burn the candidate on failure.
-        const uncommitted = this.dirtyInProgram(listed, baseline, [candidate.path]);
+        const uncommitted = this.dirtyInProgram(listed, baseline, [file.path]);
         const uncommittedNote = uncommitted.length ? [`validated_with_uncommitted: the typecheck included uncommitted files, so the raw commit may not compile without them: ${uncommitted.join(', ')}`] : [];
         let failure: ApplyResult, final = false;
         if (!checked) {
-          failure = outcome('error', `target_not_in_typecheck: tsc --listFilesOnly -p ${config.path} does not include ${candidate.path}; a typecheck without the target is not validation. Apply again with the tsconfig of the target's package.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed)));
-        } else if (checked.code === 0 || errorsOnlyElsewhere(checked, [candidate.path])) {
+          failure = outcome('error', `target_not_in_typecheck: tsc --listFilesOnly -p ${config.path} does not include ${file.path}; a typecheck without the target is not validation. Apply again with the tsconfig of the target's package.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed)));
+        } else if (checked.code === 0 || errorsOnlyElsewhere(checked, [file.path])) {
           // Passed: the target has no type errors. Errors only in other files (user decision: pre-existing or unfinished work in
           // a monorepo) are reported, not blocking. New changes besides the target (paths not dirty before) mean validation wrote files.
           const changed = await this.changedPaths() ?? [];
-          const foreign = changed.filter(path => !samePath(path, candidate.path) && !baseline.some(before => samePath(before, path)));
-          if (foreign.length || !changed.some(path => samePath(path, candidate.path))) {
+          const foreign = changed.filter(path => !samePath(path, file.path) && !baseline.some(before => samePath(before, path)));
+          if (foreign.length || !changed.some(path => samePath(path, file.path))) {
             journal('error');
             return { status: 'error', diagnostics: [`unexpected_changes: validation passed but new changes besides the target appeared; nothing was reverted: ${foreign.join(', ') || 'Git status unavailable'}`], changedFiles: changed };
           }
@@ -448,34 +456,34 @@ export class SessionStore {
             committingHead = head.stdout.trim();
             candidate.tsconfig = config.path; // saved with the journal, so a commit recovered after a crash keeps it too
             journal('committing', committingHead);
-            const added = await this.run('git', ['--literal-pathspecs', 'add', '--', candidate.path]);
+            const added = await this.run('git', ['--literal-pathspecs', 'add', '--', file.path]);
             // Anything staged while tsc ran would ride along in the commit, so the index is checked again right before it.
-            const sneaked = added.code === 0 ? (await this.staged() ?? ['(Git index unreadable)']).filter(path => !samePath(path, candidate.path)) : [];
+            const sneaked = added.code === 0 ? (await this.staged() ?? ['(Git index unreadable)']).filter(path => !samePath(path, file.path)) : [];
             const commit = added.code !== 0 ? added : sneaked.length ? undefined
               // A plain commit of the index, which holds only the target (checked above). A pathspec commit would run hooks on a
               // temporary index, so changes re-staged by hooks such as lint-staged would miss the real index.
-              : await this.run('git', ['commit', '-m', `test: ${base === null ? 'add' : 'update'} ${candidate.path}`, '-m', `${CANDIDATE_TRAILER}: ${candidateId}`]);
+              : await this.run('git', ['commit', '-m', `${state.commitType}: ${base === null ? 'add' : 'update'} ${file.path}`, '-m', `${CANDIDATE_TRAILER}: ${candidateId}`]);
             // A killed or timed-out git (e.g. a slow post-commit hook) may still have created the commit: HEAD decides, not the exit code.
             // Captured at once: later checks and postprocess must judge this commit even if the developer commits meanwhile.
             const created = commit && added.code === 0 ? (await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() : committingHead;
             const moved = commit !== undefined && commit.code !== 0 && created !== committingHead;
             if (commit && (commit.code === 0 || moved)) {
               // Every post-commit outcome is final: the commit stays in history and a retry must not commit again.
-              const judged = await this.committedResult(committingHead, created, [candidate], baseline, tsc, tsconfig, full);
+              const judged = await this.committedResult(committingHead, created, [file], baseline, tsc, tsconfig, full);
               if (judged.status === 'committed') candidate.rawCommit = created;
               const prefix = moved ? ['commit_exit_nonzero: git reported a failure after creating the commit; the commit was kept.', ...commandDiagnostics(commit)] : [];
               candidate.applyResult = { ...judged, diagnostics: [...prefix, ...judged.diagnostics, ...uncommittedNote, ...outsideNote(checked)] };
               journal(candidate.applyResult.status === 'committed' ? 'committed' : 'error');
               return candidate.applyResult;
             }
-            const unstaged = await this.run('git', this.unstageArgs(candidate));
-            const unstageNotes = unstaged.code === 0 ? [] : [`unstage_failed: ${candidate.path} may still be staged.`, ...commandDiagnostics(unstaged)];
+            const unstaged = await this.run('git', this.unstageArgs(file));
+            const unstageNotes = unstaged.code === 0 ? [] : [`unstage_failed: ${file.path} may still be staged.`, ...commandDiagnostics(unstaged)];
             failure = commit ? outcome('error', 'commit_failed: Git or a hook refused the commit; the target was unstaged and the candidate can be applied again.', ...commandDiagnostics(commit), ...unstageNotes)
               : outcome('conflict', `index_not_clean: ${sneaked.join(', ')} was staged during the apply and would have joined the commit; it stays staged, the target was unstaged, and the candidate can be applied again.`, ...unstageNotes);
           }
         } else {
           // Only real tsc errors in the target judge the candidate. A timeout, kill or failure without diagnostics must not burn it.
-          const completed = typeof checked.code === 'number', inTarget = completed && reportsErrorIn(checked, [candidate.path]);
+          const completed = typeof checked.code === 'number', inTarget = completed && reportsErrorIn(checked, [file.path]);
           // Errors in the target are the candidate's fault only when no uncommitted file in the program could cause them.
           final = inTarget && !uncommitted.length;
           failure = final ? outcome('validation_failed', ...commandDiagnostics(checked))
@@ -483,13 +491,13 @@ export class SessionStore {
             : completed ? outcome('error', 'typecheck_unrecognized: tsc failed without error diagnostics (e.g. it crashed), so the target cannot be judged; the candidate can be applied again.', ...commandDiagnostics(checked))
             : outcome('error', 'typecheck_not_completed: tsc did not finish; the candidate can be applied again.', ...commandDiagnostics(checked));
         }
-        const restored = this.restore(candidate) === 'restored';
-        if (!restored) failure = outcome('conflict', ...failure.diagnostics, `restore_conflict: ${candidate.path} changed during validation and was left untouched.`);
+        const restored = this.restore(file) === 'restored';
+        if (!restored) failure = outcome('conflict', ...failure.diagnostics, `restore_conflict: ${file.path} changed during validation and was left untouched.`);
         if (final) candidate.applyResult = failure; // a completed typecheck is final for this immutable candidate
         journal(!restored ? 'conflict' : failure.status === 'error' ? 'error' : 'restored');
         return failure;
       } catch (error: unknown) {
-        const phase = committingHead !== undefined ? this.recoverCommit(candidate, committingHead) : this.restore(candidate);
+        const phase = committingHead !== undefined ? this.recoverCommit(candidate, committingHead) : this.restore(file);
         journal(phase === 'restored' ? 'error' : phase);
         throw error;
       }
@@ -552,6 +560,7 @@ export class SessionStore {
       return { state, candidate, raw: candidate.rawCommit };
     };
     let { state, candidate, raw } = committed();
+    const target = candidate.files[0].path; // a raw commit exists only for a single-file candidate
     // Only final outcomes are stored, so a repeat never runs tools, tsc or Git.
     if (candidate.postprocessResult) return candidate.postprocessResult;
     this.assertNoWriter();
@@ -573,16 +582,17 @@ export class SessionStore {
       if ((await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() !== raw) {
         return outcome('conflict', 'head_moved: postprocess runs only directly on top of the raw commit, and HEAD has moved since candidate_apply.');
       }
-      if (baseline.some(path => samePath(path, candidate.path))) return outcome('conflict', `target_dirty: ${candidate.path} has uncommitted changes; commit or remove them first.`);
+      const dirty = candidate.files.find(file => baseline.some(path => samePath(path, file.path)));
+      if (dirty) return outcome('conflict', `target_dirty: ${dirty.path} has uncommitted changes; commit or remove them first.`);
       const staged = await this.stagedConflict();
       if (staged) return staged;
       const paths = (await this.run('git', ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', raw])).stdout.split('\0').filter(Boolean);
       const missing = paths.filter(path => { try { return !statSync(this.safePath(path, true)).isFile(); } catch { return true; } });
       if (!paths.length || missing.length) return outcome('error', `raw_paths_unavailable: every path of the raw commit must be a regular file: ${missing.join(', ') || 'no paths'}`);
-      // Defence in depth: never format a commit that is not this candidate's single-target raw commit.
+      // Defence in depth: never format a commit that is not this candidate's raw commit of exactly its files.
       const rawMessage = (await this.run('git', ['log', '-1', '--format=%B', raw])).stdout;
-      if (paths.length !== 1 || !samePath(paths[0], candidate.path) || !rawMessage.includes(`${CANDIDATE_TRAILER}: ${candidate.id}`)) {
-        return outcome('error', `raw_commit_mismatch: the recorded raw commit is not this candidate's single-target commit; nothing was changed: ${paths.join(', ') || 'no paths'}`);
+      if (paths.length !== candidate.files.length || paths.some(path => !candidate.files.some(file => samePath(file.path, path))) || !rawMessage.includes(`${CANDIDATE_TRAILER}: ${candidate.id}`)) {
+        return outcome('error', `raw_commit_mismatch: the recorded raw commit is not a commit of exactly this candidate's files; nothing was changed: ${paths.join(', ') || 'no paths'}`);
       }
       // ESLint ignores files outside its base directory, which would silently look like no_changes.
       const toolPaths = paths.map(path => relative(packageFull, join(this.root, path)));
@@ -631,7 +641,7 @@ export class SessionStore {
         journal('postprocess_validating', formatted);
         let completed = false;
         if (!failure) {
-          const full = this.safePath(candidate.path, false), { listed, checked } = await this.typecheck(tsc, tsconfig, full);
+          const full = this.safePath(target, false), { listed, checked } = await this.typecheck(tsc, tsconfig, full);
           const uncommitted = this.dirtyInProgram(listed, baseline, touched); // as in candidateApply
           // As in candidateApply: errors only in other files are reported, not blocking.
           if (checked && (checked.code === 0 || errorsOnlyElsewhere(checked, touched))) {
@@ -640,7 +650,7 @@ export class SessionStore {
             // As in candidateApply: anything staged while tsc ran would ride along, so the index is checked again right before the commit.
             const sneaked = added.code === 0 ? (await this.staged() ?? ['(Git index unreadable)']).filter(path => !touched.some(own => samePath(own, path))) : [];
             const commit = added.code !== 0 ? added : sneaked.length ? undefined
-              : await this.run('git', ['commit', '-m', `style: format ${candidate.path}`, '-m', `${POSTPROCESS_TRAILER}: ${candidate.id}`]);
+              : await this.run('git', ['commit', '-m', `style: format ${target}`, '-m', `${POSTPROCESS_TRAILER}: ${candidate.id}`]);
             // As in candidateApply: HEAD, not the exit code, decides whether a commit exists.
             const created = commit && added.code === 0 ? (await this.run('git', ['rev-parse', '--verify', 'HEAD'])).stdout.trim() : raw;
             const moved = commit !== undefined && commit.code !== 0 && created !== raw;
@@ -655,7 +665,7 @@ export class SessionStore {
             failure = commit ? ['commit_failed: Git or a hook refused the postprocess commit; the raw commit stays and postprocess can run again.', ...commandDiagnostics(commit), ...unstageNotes]
               : [`index_not_clean: ${sneaked.join(', ')} was staged during postprocess and would have joined the commit; it stays staged and postprocess can run again.`, ...unstageNotes];
           } else if (!checked) {
-            failure = [`target_not_in_typecheck: tsc --listFilesOnly -p ${config.path} does not include ${candidate.path}; a typecheck without the target is not validation.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed))];
+            failure = [`target_not_in_typecheck: tsc --listFilesOnly -p ${config.path} does not include ${target}; a typecheck without the target is not validation.`, ...(listed.code === 0 ? [] : commandDiagnostics(listed))];
           } else {
             // Only real tsc errors in the formatted files, with no uncommitted file in the program to blame, judge the formatting.
             const inTouched = typeof checked.code === 'number' && reportsErrorIn(checked, touched);
@@ -714,12 +724,12 @@ export class SessionStore {
     return { estimatedInputTokens, warnings: estimatedInputTokens >= WARNING_BUDGET ? [`Estimated input exceeds ${WARNING_BUDGET} tokens; tokenizer error is unknown.`] : [],
       estimateMethod: 'conservative_utf8_bytes_div_3_plus_256_not_exact_tokenizer' };
   }
-  start(input: { objective: string; allowedPaths: string[]; acceptanceCriteria?: string[] }): { sessionId: string } {
-    if (input.allowedPaths.length !== 1 || !/\.test\.tsx?$/.test(input.allowedPaths[0])) {
-      throw new SessionError('invalid_path', 'Pilot requires exactly one .test.ts(x) target path.');
-    }
-    this.safePath(input.allowedPaths[0], false);
-    const state: Session = { id: randomUUID(), workspaceRoot: this.root, ...input,
+  start(input: { objective: string; allowedPaths: string[]; acceptanceCriteria?: string[]; commitType?: CommitType }): { sessionId: string } {
+    if (!input.allowedPaths.length || input.allowedPaths.length > MAX_ALLOWED_PATHS) throw new SessionError('invalid_path', `Give 1-${MAX_ALLOWED_PATHS} allowed target paths.`);
+    input.allowedPaths.forEach(path => this.safePath(path, false));
+    const allowedPaths = input.allowedPaths.map(slash);
+    if (allowedPaths.some((path, index) => allowedPaths.findIndex(other => samePath(other, path)) !== index)) throw new SessionError('invalid_path', 'Allowed target paths must be distinct.');
+    const state: Session = { id: randomUUID(), workspaceRoot: this.root, objective: input.objective, allowedPaths, commitType: input.commitType ?? 'test',
       brief: '', acceptanceCriteria: input.acceptanceCriteria ?? [], contextRevision: 0,
       context: [], turns: [], errors: [], pending: false, candidates: [] };
     this.budget(this.prompt(state));
@@ -753,29 +763,27 @@ export class SessionStore {
       throw safe;
     }
   }
-  async workerChat(id: string, message: string): Promise<{ candidateId?: string; artifact?: { path: string; content: string }; candidateDiagnostics?: Array<{ code: string; message: string }>; responsePreview?: string; finishReason: 'stop'; usage: { inputTokens: number | null; outputTokens: number | null }; estimatedInputTokens: number; warnings: string[]; estimateMethod: string }> {
+  async workerChat(id: string, message: string): Promise<{ candidateId?: string; artifacts?: Array<Pick<CandidateFile, 'path' | 'content' | 'edits'>>; candidateDiagnostics?: Problem[]; responsePreview?: string; finishReason: 'stop'; usage: { inputTokens: number | null; outputTokens: number | null }; estimatedInputTokens: number; warnings: string[]; estimateMethod: string }> {
     const state = this.ready(id);
     try {
       if (!state.contextRevision || !state.brief.trim() || !state.context.length) throw new SessionError('context_not_ready', 'Set context before inference.');
-      const prompt = this.prompt(state, message), budget = this.budget(prompt);
-      const base = this.targetBase(state.allowedPaths[0]);
+      // Read once: the worker's edits must apply to exactly the snapshots it was shown.
+      const targets = this.targets(state), prompt = this.prompt(state, message, targets), budget = this.budget(prompt);
       state.pending = true;
       state.turns.push({ role: 'supervisor', text: message, contextRevision: state.contextRevision });
       this.save(state);
       const response = await chat(this.config, prompt, OUTPUT_RESERVE);
       if (!response.ok) throw new SessionError(response.error.code, response.error.message);
       state.pending = false;
-      state.turns.push({ role: 'worker', text: response.text, contextRevision: state.contextRevision });
-      let candidateId: string | undefined, candidateDiagnostics: Array<{ code: string; message: string }> | undefined;
-      try { candidateId = this.addCandidate(state, response.text, base); } catch (error: unknown) {
-        if (!(error instanceof SessionError)) throw error;
-        candidateDiagnostics = [{ code: error.code, message: error.message }];
-        state.errors.push({ ...candidateDiagnostics[0], contextRevision: state.contextRevision });
-      }
+      const parsed = parseCandidate(response.text, targets, MAX_FILE_BYTES), problems = 'problems' in parsed ? parsed.problems : undefined;
+      state.turns.push({ role: 'worker', text: response.text, contextRevision: state.contextRevision, ...(problems ? { problems } : {}) });
+      let created: Candidate | undefined;
+      if ('files' in parsed) state.candidates.push(created = { id: randomUUID(), files: parsed.files, contextRevision: state.contextRevision, state: 'draft', findings: [], reviews: [] });
+      for (const problem of problems ?? []) state.errors.push({ code: problem.code, message: problem.message, contextRevision: state.contextRevision });
       this.save(state);
       // A candidate is returned as readable code; the raw JSON reply stays in turns and is shown only when it failed to parse.
-      const created = candidateId ? this.candidate(state, candidateId) : undefined;
-      return { ...(created ? { candidateId, artifact: { path: created.path, content: created.content } } : { candidateDiagnostics, responsePreview: response.text }),
+      return { ...(created ? { candidateId: created.id, artifacts: created.files.map(({ path, content, edits }) => ({ path, content, ...(edits ? { edits } : {}) })) }
+        : { candidateDiagnostics: problems, responsePreview: response.text }),
         finishReason: response.finishReason,
         usage: response.usage ?? { inputTokens: null, outputTokens: null }, ...budget };
     } catch (error: unknown) {

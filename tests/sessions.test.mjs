@@ -87,7 +87,7 @@ test('candidate versions and rejection feedback survive restart with immutable g
   const first = await store.workerChat(id, 'Generate first version');
   assert.ok(first.candidateId);
   // The reviewer gets readable code at once; the raw JSON reply would only duplicate it.
-  assert.deepEqual(first.artifact, { path: 'value.test.ts', content: 'reply-1' });
+  assert.deepEqual(first.artifacts, [{ path: 'value.test.ts', content: 'reply-1' }]);
   assert.equal(first.responsePreview, undefined);
   const firstPrompt = JSON.parse(f.requests[0].messages.at(-1).content);
   assert.deepEqual(firstPrompt.acceptanceCriteria, context.acceptanceCriteria);
@@ -120,7 +120,7 @@ test('candidate versions and rejection feedback survive restart with immutable g
   const third = await store.workerChat(id, 'Old-version review must not reach the approved latest code');
   const afterOldReview = JSON.parse(f.requests[2].messages.at(-1).content);
   assert.deepEqual(afterOldReview.openFeedback, []);
-  assert.equal(afterOldReview.currentCandidate.content, 'reply-2');
+  assert.deepEqual(afterOldReview.currentCandidate.files, [{ path: 'value.test.ts', content: 'reply-2' }]);
   const latestFindings = [{ severity: 'major', message: 'Cover the negative input' }];
   store.candidateReview(id, third.candidateId, 'reject', latestFindings);
   store.candidateReview(id, first.candidateId, 'reject', [{ severity: 'minor', message: 'Late note on the first version' }]);
@@ -128,7 +128,7 @@ test('candidate versions and rejection feedback survive restart with immutable g
   await store.workerChat(id, 'Revise the latest version');
   const afterLatestReject = JSON.parse(f.requests[3].messages.at(-1).content);
   assert.deepEqual(afterLatestReject.openFeedback, latestFindings);
-  assert.equal(afterLatestReject.currentCandidate.content, 'reply-3');
+  assert.deepEqual(afterLatestReject.currentCandidate.files, [{ path: 'value.test.ts', content: 'reply-3' }]);
   store.contextSet(id, context);
   assert.throws(() => store.candidateReview(id, second.candidateId, 'approve', []), /stale/i);
   assert.equal(store.candidateRead(id, second.candidateId).state, 'stale');
@@ -203,9 +203,11 @@ test('context and allowed targets reject traversal, drive/UNC paths and symlink 
   for (const path of ['../source.ts', '..\\source.ts', 'C:\\secret.ts', '\\\\host\\share\\secret.ts', 'source.ts:stream']) {
     assert.throws(() => store.contextSet(id, { ...context, files: [path] }), /path/i);
   }
-  for (const allowedPaths of [['../value.test.ts'], ['bad.ts'], ['a.test.ts', 'b.test.ts']]) {
-    assert.throws(() => store.start({ objective: 'test', allowedPaths }), /path|one|test/i);
+  // 1-8 distinct workspace paths of any kind; duplicates are caught after normalising separators.
+  for (const allowedPaths of [[], ['../value.test.ts'], Array.from({ length: 9 }, (_, index) => `f${index}.ts`), ['a.ts', 'a.ts'], ['dir/a.ts', 'dir\\a.ts']]) {
+    assert.throws(() => store.start({ objective: 'test', allowedPaths }), /path/i);
   }
+  assert.ok(store.start({ objective: 'test', allowedPaths: ['bad.ts', 'dir/b.test.ts'] }).sessionId);
   const outside = join(f.temp, 'outside');
   mkdirSync(outside);
   writeFileSync(join(outside, 'secret.ts'), 'outside');
@@ -292,4 +294,167 @@ test('backend errors are durable and pending chat blocks another chat/context up
   assert.equal(JSON.stringify(status).includes('private-backend-body'), false);
   assert.equal(status.pendingAction, undefined);
   assert.equal(f.requests.length, 1);
+});
+
+// Replies in order; objects are sent as their JSON.
+const say = (...replies) => {
+  const queue = replies.map(reply => typeof reply === 'string' ? reply : JSON.stringify(reply));
+  return res => res.end(JSON.stringify({ choices: [{ message: { content: queue.shift() ?? 'no reply' }, finish_reason: 'stop' }] }));
+};
+const promptOf = (f, index = -1) => JSON.parse(f.requests.at(index).messages.at(-1).content);
+const LINES = Array.from({ length: 10 }, (_, index) => `const a${index + 1} = ${index + 1};`).join('\n') + '\n';
+const CALC = 'export function calc(x: number) {\n  const a = 1;\n  return x + a;\n}\n// marker\n// marker\n';
+// A session whose targets are the given files (content, or null for a new file), with calc.ts also selected as context.
+function targets(f, files, extra = {}) {
+  for (const [path, content] of Object.entries(files)) if (content !== null) writeFileSync(join(f.root, path), content);
+  const store = f.open(), id = store.start({ objective: 'Add feature', allowedPaths: Object.keys(files), ...extra }).sessionId;
+  store.contextSet(id, { ...context, files: existsSync(join(f.root, 'calc.ts')) ? ['calc.ts', 'source.ts'] : ['source.ts'] });
+  return { store, id };
+}
+
+test('a multi-file candidate edits an existing target and creates a new one, with artifacts, minimal diffs and stored bases', async (t) => {
+  const edits = [{ search: 'const a5 = 5;\n', replace: 'const a5 = 50;\n' }];
+  const f = await fixture(t, say({ files: [{ path: 'calc.ts', edits }, { path: 'calc.test.ts', content: 'test();\n' }] }));
+  const { store, id } = targets(f, { 'calc.ts': LINES, 'calc.test.ts': null }, { commitType: 'feat' });
+  const result = await store.workerChat(id, 'Implement');
+  assert.deepEqual(result.artifacts, [{ path: 'calc.ts', content: LINES.replace('a5 = 5', 'a5 = 50'), edits }, { path: 'calc.test.ts', content: 'test();\n' }]);
+  const prompt = promptOf(f);
+  assert.deepEqual(prompt.targets, [{ path: 'calc.ts', content: LINES }, { path: 'calc.test.ts', new: true }]);
+  assert.deepEqual(prompt.context.map(snapshot => snapshot.path), ['source.ts']); // a target is not sent twice
+  assert.match(prompt.outputContract.instruction, /not to currentCandidate/);
+  assert.deepEqual(store.candidateRead(id, result.candidateId).artifacts.map(artifact => artifact.diff), [
+    '--- a/calc.ts\n+++ b/calc.ts\n@@ -2,7 +2,7 @@\n const a2 = 2;\n const a3 = 3;\n const a4 = 4;\n-const a5 = 5;\n+const a5 = 50;\n const a6 = 6;\n const a7 = 7;\n const a8 = 8;\n',
+    '--- /dev/null\n+++ b/calc.test.ts\n@@ -0,0 +1,1 @@\n+test();\n']);
+  const { details } = store.status(id);
+  assert.equal(details.commitType, 'feat');
+  assert.equal(details.candidates[0].files[0].base.content, LINES);
+  assert.equal(details.candidates[0].files[1].base, null);
+  // F1 never writes: applying a multi-file candidate is refused before anything is touched.
+  store.candidateReview(id, result.candidateId, 'approve', []);
+  await assert.rejects(store.candidateApply(id, result.candidateId), { code: 'multi_file_apply_unsupported' });
+  assert.equal(readFileSync(join(f.root, 'calc.ts'), 'utf8'), LINES);
+  assert.equal(existsSync(join(f.root, 'calc.test.ts')), false);
+});
+
+test('edits apply in order, each to the text left by the previous ones, and distant changes get separate hunks', async (t) => {
+  const f = await fixture(t, say({ files: [{ path: 'calc.ts', edits: [
+    { search: 'const a2 = 2;', replace: 'const a2 = 20;' },
+    { search: 'const a2 = 20;\n', replace: 'const a2 = 22;\nconst extra = 0;\n' },
+    { search: 'const a10 = 10;', replace: 'const a10 = 100;' }] }] }));
+  const { store, id } = targets(f, { 'calc.ts': LINES });
+  const result = await store.workerChat(id, 'Implement');
+  assert.equal(result.artifacts[0].content, LINES.replace('a2 = 2;', 'a2 = 22;\nconst extra = 0;').replace('a10 = 10', 'a10 = 100'));
+  assert.equal(store.candidateRead(id, result.candidateId).artifacts[0].diff, '--- a/calc.ts\n+++ b/calc.ts\n'
+    + '@@ -1,5 +1,6 @@\n const a1 = 1;\n-const a2 = 2;\n+const a2 = 22;\n+const extra = 0;\n const a3 = 3;\n const a4 = 4;\n const a5 = 5;\n'
+    + '@@ -7,4 +8,4 @@\n const a7 = 7;\n const a8 = 8;\n const a9 = 9;\n-const a10 = 10;\n+const a10 = 100;\n');
+});
+
+test('any failing edit or file means no candidate; every problem is reported and reaches the next prompt until a valid reply', async (t) => {
+  const f = await fixture(t, say({ files: [
+    { path: 'calc.ts', edits: [
+      { search: '  const a = 1', replace: '  const a = 2' }, // not whole lines
+      { search: 'const a = 1;', replace: 'const a = 2;' }, // indentation differs
+      { search: '// marker', replace: '// m' },
+      { search: 'x\n'.repeat(13), replace: '' },
+      { search: '}', replace: '  // rest of the code\n}' },
+      { search: '  return x + a;', replace: '  return x - a;' }] }, // valid on its own
+    { path: 'other.ts', content: 'export {};\n' },
+    { path: 'calc.test.ts', edits: [{ search: 'a', replace: 'b' }] }] },
+  { files: [{ path: 'calc.ts', edits: [{ search: '  const a = 1;', replace: '  const a = 2;' }] }] }));
+  const { store, id } = targets(f, { 'calc.ts': CALC, 'calc.test.ts': null });
+  const failed = await store.workerChat(id, 'Implement');
+  assert.equal(failed.candidateId, undefined);
+  assert.equal(failed.artifacts, undefined);
+  assert.equal(store.status(id).details.candidates.length, 0);
+  const problems = failed.candidateDiagnostics;
+  assert.deepEqual(problems.map(({ code, path, edit }) => [code, path, edit]), [
+    ['search_not_found', 'calc.ts', 0], ['search_not_found', 'calc.ts', 1], ['search_ambiguous', 'calc.ts', 2], ['search_too_long', 'calc.ts', 3],
+    ['placeholder', 'calc.ts', 4], ['invalid_path', 'other.ts', undefined], ['invalid_candidate', 'calc.test.ts', undefined]]);
+  assert.match(problems[0].message, /^calc\.ts edits\[0\]: .*search line 1 vs line 2 "  const a = 1;", first difference at column 14 \(search has end of line, file has ";"\)/);
+  assert.match(problems[1].message, /only in indentation\/whitespace from lines 2-2, which are exactly: "  const a = 1;"/);
+  assert.ok(problems.slice(0, 2).every(problem => problem.message.includes('complete "content"')));
+  assert.match(problems[2].message, /matches 2 times \(lines 5, 6\)/);
+  assert.equal(readFileSync(join(f.root, 'calc.ts'), 'utf8'), CALC);
+  const fixed = await store.workerChat(id, 'Fix the reported problems');
+  assert.deepEqual(promptOf(f).previousReplyProblems, problems);
+  assert.equal(fixed.artifacts[0].content, CALC.replace('a = 1', 'a = 2'));
+  await store.workerChat(id, 'Next');
+  assert.equal(promptOf(f).previousReplyProblems, undefined);
+});
+
+test('CRLF bases stay CRLF through edits and content, a BOM is kept, and mixed line endings refuse edits but take content', async (t) => {
+  const mixed = { path: 'mixed.ts', edits: [{ search: 'b', replace: 'B' }] };
+  const f = await fixture(t, say({ files: [mixed] }, { files: [
+    { path: 'crlf.ts', edits: [{ search: 'b\r\n', replace: 'B\nB2\n' }] },
+    { path: 'whole.ts', content: 'p\nq\n' },
+    { path: 'bom.ts', edits: [{ search: 'const a = 1;', replace: 'const a = 2;' }] },
+    { path: 'mixed.ts', content: 'm\n' }] }));
+  const { store, id } = targets(f, { 'crlf.ts': 'a\r\nb\r\nc\r\n', 'whole.ts': 'x\r\ny\r\n', 'bom.ts': '﻿const a = 1;\n', 'mixed.ts': 'a\r\nb\nc\r\n' });
+  const refused = await store.workerChat(id, 'Implement');
+  assert.deepEqual(refused.candidateDiagnostics.map(problem => problem.code), ['mixed_line_endings']);
+  assert.match(refused.candidateDiagnostics[0].message, /"content"/);
+  const result = await store.workerChat(id, 'Use content for mixed.ts');
+  assert.deepEqual(result.artifacts.map(artifact => artifact.content), ['a\r\nB\r\nB2\r\nc\r\n', 'p\r\nq\r\n', '﻿const a = 2;\n', 'm\n']);
+  assert.match(store.candidateRead(id, result.candidateId).artifacts[0].diff, /^@@ -1,3 \+1,4 @@\n a\r\n-b\r\n\+B\r\n\+B2\r\n c\r\n$/m);
+});
+
+test('placeholders and line-number prefixes are refused, while spread syntax and numeric keys are code', async (t) => {
+  const f = await fixture(t, say({ files: [
+    { path: 'calc.ts', edits: [{ search: '  const a = 1;', replace: '2 |   const a = 2;\n3 |   return x;' }] },
+    { path: 'a.ts', content: 'test(1);\n// ...\n' },
+    { path: 'b.ts', content: 'test(1);\n…\n' },
+    { path: 'c.ts', content: '/* rest of the file */\n' },
+    { path: 'd.ts', content: 'describe(() => {\n  // ... existing code ...\n});\n' },
+    { path: 'e.ts', content: 'it();\n// other tests unchanged\n' }] },
+  { files: [{ path: 'a.ts', content: 'const f = (...args: number[]) => Math.max(...args);\nconst all = [\n  ...items,\n];\nconst names = {\n  1: \'one\',\n};\n// returns unchanged input\n// value stays unchanged\n' }] }));
+  const { store, id } = targets(f, { 'calc.ts': CALC, 'a.ts': null, 'b.ts': null, 'c.ts': null, 'd.ts': null, 'e.ts': null });
+  const refused = await store.workerChat(id, 'Implement');
+  assert.deepEqual(refused.candidateDiagnostics.map(problem => [problem.code, problem.path]),
+    [['line_numbers', 'calc.ts'], ['placeholder', 'a.ts'], ['placeholder', 'b.ts'], ['placeholder', 'c.ts'], ['placeholder', 'd.ts'], ['placeholder', 'e.ts']]);
+  assert.ok((await store.workerChat(id, 'Write complete code')).candidateId);
+});
+
+test('one outer fence around the whole reply is stripped, text around it is not, and the legacy path/content shape still works', async (t) => {
+  const legacy = JSON.stringify({ path: 'value.test.ts', content: 'legacy();\n' });
+  const f = await fixture(t, say(`\`\`\`json\n${JSON.stringify({ files: [{ path: 'value.test.ts', content: 'fenced();\n' }] })}\n\`\`\``,
+    `Here it is:\n\`\`\`json\n${legacy}\n\`\`\``, `\`\`\`\n${legacy}\n\`\`\``));
+  const store = f.open(), id = start(store);
+  store.contextSet(id, context);
+  assert.equal((await store.workerChat(id, 'one')).artifacts[0].content, 'fenced();\n');
+  assert.deepEqual((await store.workerChat(id, 'two')).candidateDiagnostics.map(problem => problem.code), ['invalid_candidate']);
+  assert.deepEqual((await store.workerChat(id, 'three')).artifacts, [{ path: 'value.test.ts', content: 'legacy();\n' }]);
+  assert.equal(store.status(id).details.commitType, 'test');
+});
+
+test('an I2-era stored candidate with top-level path/content is read, reviewed and shown to the worker as files', async (t) => {
+  const f = await fixture(t);
+  let store = f.open();
+  const id = start(store);
+  writeFileSync(join(f.root, 'value.test.ts'), 'old line\n');
+  store.contextSet(id, context);
+  const { candidateId } = await store.workerChat(id, 'first');
+  const legacy = store.status(id).details;
+  const [{ files: [file], ...candidate }] = legacy.candidates;
+  legacy.candidates = [{ ...candidate, path: file.path, content: file.content, base: file.base, diff: file.diff }];
+  delete legacy.commitType;
+  store.close();
+  const db = new DatabaseSync(join(f.root, '.stateful-worker', 'state.sqlite'));
+  db.prepare('UPDATE sessions SET state = ? WHERE id = ?').run(JSON.stringify(legacy), id);
+  db.close(); store = f.open();
+  const read = store.candidateRead(id, candidateId);
+  assert.deepEqual(read.artifacts, [{ path: 'value.test.ts', content: 'reply-1', diff: file.diff }]);
+  assert.equal(store.status(id).details.commitType, 'test');
+  store.candidateReview(id, candidateId, 'reject', [{ severity: 'major', message: 'More cases' }]);
+  await store.workerChat(id, 'second');
+  assert.deepEqual(promptOf(f).currentCandidate.files, [{ path: 'value.test.ts', content: 'reply-1' }]);
+});
+
+test('target snapshots count towards the input budget', async (t) => {
+  const f = await fixture(t), store = f.open();
+  writeFileSync(join(f.root, 'big.ts'), 'x'.repeat(150000));
+  const brief = 'y'.repeat(60000);
+  const small = store.start({ objective: 'Edit', allowedPaths: ['value.test.ts'] }).sessionId;
+  assert.equal(store.contextSet(small, { ...context, brief }).contextRevision, 1);
+  const big = store.start({ objective: 'Edit', allowedPaths: ['big.ts'] }).sessionId;
+  assert.throws(() => store.contextSet(big, { ...context, brief }), { code: 'budget_exceeded' });
 });

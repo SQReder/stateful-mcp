@@ -24,6 +24,13 @@ test('approved compilable candidate is committed alone with a trailer, and a rep
   assert.equal(readFileSync(f.target, 'utf8'), PASSING);
 });
 
+test('the session commitType names the raw commit subject', async (t) => {
+  const f = await fixture(t, { base: BASE });
+  const store = f.open(), id = await f.session(store, { commitType: 'fix' }), c = await f.candidate(store, id, PASSING), before = f.head();
+  assert.equal((await store.candidateApply(id, c)).status, 'committed');
+  assert.equal(f.committed(before).message.trim(), `fix: update value.test.ts\n\nStateful-Worker-Candidate: ${c}`);
+});
+
 test('hooks that reformat the target commit with a diff, but a hook that breaks the typecheck keeps the commit as an error', async (t) => {
   for (const [line, status] of [['// formatted by hook', 'committed'], ['const broken: string = 1;', 'error']]) {
     const f = await fixture(t, { base: BASE });

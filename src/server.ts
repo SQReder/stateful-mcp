@@ -69,8 +69,9 @@ async function sessionResult(operation: (store: SessionStore) => Record<string, 
 
 const text = z.string().refine(value => value.trim().length > 0, 'Must not be blank.');
 server.registerTool('session_start', {
-  description: 'Start a durable session for one allowed test file; does not write source files.',
-  inputSchema: z.object({ objective: text, allowedPaths: z.array(text).length(1), acceptanceCriteria: z.array(text).optional() }).strict(),
+  description: 'Start a durable session for 1-8 distinct workspace-relative target files (existing or new) the worker may change; does not write source files. '
+    + 'Existing targets are sent to the worker whole on every turn and count towards the input budget. commitType (test, feat or fix; default test) prefixes the raw commit subject.',
+  inputSchema: z.object({ objective: text, allowedPaths: z.array(text).min(1).max(8), acceptanceCriteria: z.array(text).optional(), commitType: z.enum(['test', 'feat', 'fix']).optional() }).strict(),
 }, input => sessionResult(store => store.start(input)));
 
 server.registerTool('context_set', {
@@ -79,7 +80,9 @@ server.registerTool('context_set', {
 }, ({ sessionId, ...input }) => sessionResult(store => store.contextSet(sessionId, input)));
 
 server.registerTool('worker_chat', {
-  description: 'One inference using selected context, latest candidate once and its findings if it was rejected. Requests one JSON path/content artifact and returns a new candidate as candidateId plus artifact {path, content}, ready for review without candidate_read; invalid replies return responsePreview and candidate diagnostics. Never applies code.',
+  description: 'One inference using selected context, the current target files, latest candidate once and its findings if it was rejected. '
+    + 'The worker returns search/replace edits for existing targets or complete content; a valid reply becomes a new candidate returned as candidateId plus artifacts [{path, content (resulting full file), edits?}], ready for review without candidate_read. '
+    + 'If any edit or file is invalid, no candidate is created: the reply returns responsePreview and candidateDiagnostics (code, path, edit index, hint), which are also sent to the worker on the next worker_chat. Never applies code.',
   inputSchema: z.object({ sessionId: text, message: text }).strict(),
 }, ({ sessionId, message }) => sessionResult(store => store.workerChat(sessionId, message)));
 
@@ -93,7 +96,7 @@ server.registerTool('session_status', {
 }));
 
 server.registerTool('candidate_read', {
-  description: 'Read one immutable full-code candidate with its generation-time unified replacement diff and review history; for older versions, diffs or after a restart. Not needed right after worker_chat, which already returns the code. Does not read current source files.',
+  description: 'Read one immutable candidate as artifacts [{path, content, diff, edits?}] (resulting full files with minimal unified diffs from their generation-time bases) and its review history; for older versions, diffs or after a restart. Not needed right after worker_chat, which already returns the code. Does not read current source files.',
   inputSchema: z.object({ sessionId: text, candidateId: text }).strict(),
   annotations: { readOnlyHint: true, openWorldHint: false },
 }, ({ sessionId, candidateId }) => sessionResult(store => store.candidateRead(sessionId, candidateId)));
@@ -105,7 +108,7 @@ server.registerTool('candidate_review', {
 }, ({ sessionId, candidateId, verdict, findings }) => sessionResult(store => store.candidateReview(sessionId, candidateId, verdict, findings)));
 
 server.registerTool('candidate_apply', {
-  description: 'Write one approved, current-revision candidate into a clean Git workspace and typecheck it with the tsc nearest to the chosen tsconfig. '
+  description: 'Write one approved, current-revision single-file candidate into a clean Git workspace and typecheck it with the tsc nearest to the chosen tsconfig; a candidate with several files is refused with multi_file_apply_unsupported. '
     + 'tsconfig: workspace-relative .json of the target\'s package (needed in monorepos); default WORKER_TSCONFIG. It must include the target, otherwise error target_not_in_typecheck, which can be retried with another tsconfig. '
     + 'On success stages only the target and creates one local commit with Git hooks enabled (no push). '
     + 'Returns status committed (hooksModified: true plus a candidate->committed diff when hooks changed the file and it passed the typecheck again), validation_failed (diagnostics, file restored), conflict (dirty tree, changed snapshots/target or external edit; nothing overwritten), no_changes or error. '
