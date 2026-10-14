@@ -476,7 +476,8 @@ export class SessionStore {
           // in a monorepo) are reported, not blocking. New changes besides the targets (paths not dirty before) mean validation wrote files,
           // and every written file must show as changed (one ignored by Git would silently miss the commit).
           const status = await this.changedPaths(), changed = status ?? [];
-          const foreign = changed.filter(path => !paths.some(mine => samePath(mine, path)) && !baseline.some(before => samePath(before, path)));
+          // Only written files may change: an unchanged candidate file edited meanwhile was typechecked but would miss the commit.
+          const foreign = changed.filter(path => !writtenPaths.some(mine => samePath(mine, path)) && !baseline.some(before => samePath(before, path)));
           const unseen = writtenPaths.filter(mine => !changed.some(path => samePath(mine, path)));
           if (foreign.length || unseen.length) {
             journal('error');
@@ -492,7 +493,8 @@ export class SessionStore {
             journal('committing', committingHead);
             const added = await this.run('git', ['--literal-pathspecs', 'add', '--', ...writtenPaths]);
             const sneaked = added.code === 0 ? await this.indexMismatch(writtenPaths) : [];
-            const objective = state.objective.trim().split(/\r?\n/)[0].slice(0, MAX_SUBJECT_OBJECTIVE).trimEnd();
+            // Cut by code points: a UTF-16 cut could split an emoji into a lone surrogate, which becomes U+FFFD in the commit.
+            const objective = Array.from(state.objective.trim().split(/\r?\n/)[0]).slice(0, MAX_SUBJECT_OBJECTIVE).join('').trimEnd();
             const commit = added.code !== 0 ? added : sneaked.length ? undefined
               // A plain commit of the index, which holds only the written files (checked above). A pathspec commit would run hooks on a
               // temporary index, so changes re-staged by hooks such as lint-staged would miss the real index.

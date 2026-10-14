@@ -30,6 +30,24 @@ test('the raw commit subject is the session commitType and the first line of the
   const c = await f.candidate(store, id, PASSING), before = f.head();
   assert.equal((await store.candidateApply(id, c)).status, 'committed');
   assert.equal(f.committed(before).message.split('\n')[0], `test: Cover ${'x'.repeat(66)}`);
+  // An emoji on the cut is kept or dropped whole, never split into a replacement character.
+  const g = await fixture(t);
+  const other = g.open(), otherId = await g.session(other, { objective: `${'x'.repeat(71)}🙂 tail` });
+  const d = await g.candidate(other, otherId, PASSING), start = g.head();
+  assert.equal((await other.candidateApply(otherId, d)).status, 'committed');
+  assert.equal(g.committed(start).message.split('\n')[0], `test: ${'x'.repeat(71)}🙂`);
+});
+
+test('an unchanged candidate file edited while tsc runs stops the commit, since the commit would not contain what was checked', async (t) => {
+  const f = await fixture(t);
+  const store = f.open(), { id, c, before } = await feature(f, store, { files: [{ path: 'source.ts', content: SOURCE }, { path: 'value.test.ts', content: PASSING }] });
+  const running = store.candidateApply(id, c);
+  while (store.status(id).phase !== 'validating') await new Promise(resolve => setImmediate(resolve));
+  writeFileSync(join(f.root, 'source.ts'), 'export const value = 2;\n'); // tsc runs for far longer than this
+  const result = await running;
+  assert.equal(result.status, 'error');
+  assert.match(result.diagnostics.join('\n'), /unexpected_changes.*source\.ts/);
+  assert.equal(f.head(), before);
 });
 
 test('the session commitType names the raw commit subject', async (t) => {

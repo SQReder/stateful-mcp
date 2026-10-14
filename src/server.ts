@@ -31,7 +31,7 @@ server.registerTool('worker_diagnostics', {
 }, () => {
   try {
     const config = readConfig();
-    return result({ configured: true, model: config.model, timeoutMs: config.timeoutMs, stage: 'F1',
+    return result({ configured: true, model: config.model, timeoutMs: config.timeoutMs, stage: 'F2',
       ...('root' in workspace ? { workspaceRoot: workspace.root } : { workspaceError: workspace.error }) });
   } catch (error: unknown) {
     if (!(error instanceof ConfigurationError)) throw error;
@@ -108,11 +108,11 @@ server.registerTool('candidate_review', {
 }, ({ sessionId, candidateId, verdict, findings }) => sessionResult(store => store.candidateReview(sessionId, candidateId, verdict, findings)));
 
 server.registerTool('candidate_apply', {
-  description: 'Write one approved, current-revision single-file candidate into a clean Git workspace and typecheck it with the tsc nearest to the chosen tsconfig; a candidate with several files is refused with multi_file_apply_unsupported. '
-    + 'tsconfig: workspace-relative .json of the target\'s package (needed in monorepos); default WORKER_TSCONFIG. It must include the target, otherwise error target_not_in_typecheck, which can be retried with another tsconfig. '
-    + 'On success stages only the target and creates one local commit with Git hooks enabled (no push). '
-    + 'Returns status committed (hooksModified: true plus a candidate->committed diff when hooks changed the file and it passed the typecheck again), validation_failed (diagnostics, file restored), conflict (dirty tree, changed snapshots/target or external edit; nothing overwritten), no_changes or error. '
-    + 'Error commit_failed (e.g. a hook refused) restores the file and may be retried; commit_scope_violation and hooks_broke_typecheck keep the commit and are final. '
+  description: 'Write one approved, current-revision candidate (all its files that differ from their bases) into the Git workspace and typecheck it with the tsc nearest to the chosen tsconfig. '
+    + 'tsconfig: workspace-relative .json of the targets\' package (needed in monorepos); default WORKER_TSCONFIG. It must include every TypeScript file of the candidate, otherwise error target_not_in_typecheck, which can be retried with another tsconfig. '
+    + 'On success stages only the candidate files and creates one local commit "<commitType>: <objective>" with Git hooks enabled (no push). '
+    + 'Returns status committed (hooksModified: true plus a candidate->committed diff when hooks changed files and they passed the typecheck again), validation_failed (diagnostics, files restored), conflict (dirty or changed targets, changed snapshots or external edits; nothing overwritten), no_changes or error. '
+    + 'Error commit_failed (e.g. a hook refused) restores the files and may be retried; commit_scope_violation and hooks_broke_typecheck keep the commit and are final. '
     + 'Session/candidate refusals (not approved, stale, busy, missing configuration) are tool errors with a code and write nothing. A failed typecheck is final: generate and review a new one. Repeating a finished apply returns the stored result without a new commit.',
   inputSchema: z.object({ sessionId: text, candidateId: text, tsconfig: text.optional() }).strict(),
   annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
