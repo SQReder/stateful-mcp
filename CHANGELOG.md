@@ -3,7 +3,8 @@
 ## [Unreleased]
 
 ### Added
-- Accept multi-file candidates: 1-8 target files per session, exact whole-line search/replace edits or complete content per file, minimal review diffs, and parse problems with hints fed back to the worker; `commitType` (`test`, `feat`, `fix`) names the raw commit. Apply still takes single-file candidates until stage F2.
+- Apply, commit and postprocess multi-file candidates: per-file preconditions, only changed files written and committed, every TypeScript file required in the typecheck, per-file restore.
+- Accept multi-file candidates: 1-8 target files per session, exact whole-line search/replace edits or complete content per file, minimal review diffs, and parse problems with hints fed back to the worker; `commitType` (`test`, `feat`, `fix`) names the raw commit.
 - Add `postprocess`: run trusted `WORKER_POSTPROCESS` tools (prettier, eslint) only on raw-commit paths directly on top of the raw commit, re-typecheck and commit the changes separately; failures return files to the raw commit, which always stays.
 - Commit a validated candidate as one local raw commit with Git hooks enabled; report hook changes as `hooksModified` with a diff after a repeated typecheck, and keep any created commit in history instead of resetting it.
 - Add `candidate_apply`: write one approved, current-revision candidate into a clean Git workspace and typecheck it with the workspace `tsc` and a trusted `WORKER_TSCONFIG` that must include the target.
@@ -22,6 +23,7 @@
 
 ### Changed
 - `worker_chat` returns `artifacts` (a list) instead of `artifact`.
+- The raw commit subject is `<commitType>: <first line of the objective>` instead of `test: add|update <path>`.
 - Allow unrelated unstaged and untracked work during `candidate_apply` and `postprocess`: only the target must be untouched (`target_dirty`) and the index empty (`index_not_clean`); tsc errors only outside the target no longer block the commit and are reported as `typecheck_errors_outside_target`.
 - Run postprocess tools only where package.json of the package or a parent declares them, skipping undeclared ones (`tool_skipped`); `WORKER_POSTPROCESS` is optional and defaults to `eslint,prettier`.
 - Let the orchestrator choose the package tsconfig in `candidate_apply` (`tsconfig`, default `WORKER_TSCONFIG`) and the package directory in `postprocess` (`packageDir`, default the tsconfig's directory) for monorepos; `tsc`, prettier and eslint resolve from that package and the tools run there.

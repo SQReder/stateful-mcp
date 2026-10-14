@@ -130,7 +130,7 @@ symlink-пути запрещены, одна DB — один процесс.
    Иначе `candidate_apply` вернёт `conflict` и ничего не запишет.
 2. После `candidate_review` с `approve` вызови `candidate_apply` с тем же
    `candidateId`. Успех — `status: "committed"`: в `git log` новый локальный
-   коммит `test: add|update <path>` только с целевым файлом; твои
+   коммит `<commitType>: <objective>` только с файлами кандидата; твои
    незакоммиченные правки остались как были. Hooks репозитория при этом
    работают. Если они изменили файл, в ответе будут `hooksModified: true` и
    diff их изменений. Пометка `validated_with_uncommitted` значит, что проверка
